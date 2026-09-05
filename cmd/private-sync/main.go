@@ -6,8 +6,9 @@ import (
 	"os"
 
 	"github.com/sanbiv/private-sync/internal/cli"
+	"github.com/sanbiv/private-sync/internal/tui"
 )
 
 func main() {
-	os.Exit(cli.Main(os.Args[1:]))
+	os.Exit(cli.Main(os.Args[1:], tui.Frontend{}))
 }
