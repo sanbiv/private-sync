@@ -190,12 +190,12 @@ func TestRclonePushBlobsFirstThenOwnFiles(t *testing.T) {
 		t.Fatalf("got %d commands, want 2:\n%v", len(f.cmds), f.cmds)
 	}
 	// Blobs first.
-	assertCmd(t, f.cmds[0], dir, []string{"copy", dir, "gdrive:vault", "--files-from", f.paths[0], "--no-traverse", "--ignore-existing", "--ask-password=false"})
+	assertCmd(t, f.cmds[0], dir, []string{"copy", dir, "gdrive:/vault", "--files-from", f.paths[0], "--no-traverse", "--ignore-existing", "--ask-password=false"})
 	if f.lists[0] != "blobs/aa/x.enc\nblobs/bb/y.enc\n" {
 		t.Errorf("blob list = %q", f.lists[0])
 	}
 	// Then the own files.
-	assertCmd(t, f.cmds[1], dir, []string{"copy", dir, "gdrive:vault", "--files-from", f.paths[1], "--no-traverse", "--ask-password=false"})
+	assertCmd(t, f.cmds[1], dir, []string{"copy", dir, "gdrive:/vault", "--files-from", f.paths[1], "--no-traverse", "--ask-password=false"})
 	wantOwn := strings.Join([]string{
 		".gitattributes",
 		"machines/" + mid + ".json.enc",
@@ -522,7 +522,7 @@ func TestNewRcloneValidation(t *testing.T) {
 		wantBlobs  string
 	}{
 		{"ok", config.RcloneRemote{Remote: "gdrive", Path: "vault"}, "v", mid, true, "gdrive:vault", "gdrive:vault/blobs"},
-		{"trailing colon and slashes", config.RcloneRemote{Remote: "gdrive:", Path: "/a//b/"}, "v", mid, true, "gdrive:a/b", "gdrive:a/b/blobs"},
+		{"trailing colon and slashes", config.RcloneRemote{Remote: "gdrive:", Path: "/a//b/"}, "v", mid, true, "gdrive:/a/b", "gdrive:/a/b/blobs"},
 		{"empty path", config.RcloneRemote{Remote: "gdrive"}, "v", mid, true, "gdrive:", "gdrive:blobs"},
 		{"empty remote", config.RcloneRemote{Path: "v"}, "v", mid, false, "", ""},
 		{"remote with path", config.RcloneRemote{Remote: "gdrive:vault"}, "v", mid, false, "", ""},

@@ -111,7 +111,7 @@ func NewRclone(cfg config.RcloneRemote, vaultDir string, o Options) (Remote, err
 	if strings.ContainsAny(o.MachineID, "/\\*?[] \t\r\n") {
 		return nil, fmt.Errorf("remote: invalid machine id %q", o.MachineID)
 	}
-	p := strings.Trim(strings.TrimSpace(filepath.ToSlash(cfg.Path)), "/")
+	p := strings.TrimRight(strings.TrimSpace(filepath.ToSlash(cfg.Path)), "/")
 	for strings.Contains(p, "//") {
 		p = strings.ReplaceAll(p, "//", "/")
 	}
