@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -102,7 +103,7 @@ func TestRcloneFetchArgs(t *testing.T) {
 	if len(f.cmds) != 2 {
 		t.Fatalf("got %d commands, want 2", len(f.cmds))
 	}
-	assertCmd(t, f.cmds[0], dir, []string{"copy", "gdrive:backup/vault/blobs", filepath.Join(dir, "blobs"), "--ignore-existing"})
+	assertCmd(t, f.cmds[0], dir, []string{"copy", "gdrive:backup/vault/blobs", filepath.Join(dir, "blobs"), "--ignore-existing", "--ask-password=false"})
 	assertCmd(t, f.cmds[1], dir, []string{
 		"copy", "gdrive:backup/vault", dir,
 		"--exclude", "/blobs/**",
@@ -110,6 +111,7 @@ func TestRcloneFetchArgs(t *testing.T) {
 		"--exclude", "projects/*/meta/" + mid + ".json.enc",
 		"--exclude", "projects/*/state/" + mid + ".json.enc",
 		"--exclude", ".psv-tmp-*",
+		"--ask-password=false",
 	})
 	if _, err := os.Stat(dir); err != nil {
 		t.Errorf("vault dir not created: %v", err)
@@ -188,12 +190,12 @@ func TestRclonePushBlobsFirstThenOwnFiles(t *testing.T) {
 		t.Fatalf("got %d commands, want 2:\n%v", len(f.cmds), f.cmds)
 	}
 	// Blobs first.
-	assertCmd(t, f.cmds[0], dir, []string{"copy", dir, "gdrive:vault", "--files-from", f.paths[0], "--no-traverse", "--ignore-existing"})
+	assertCmd(t, f.cmds[0], dir, []string{"copy", dir, "gdrive:vault", "--files-from", f.paths[0], "--no-traverse", "--ignore-existing", "--ask-password=false"})
 	if f.lists[0] != "blobs/aa/x.enc\nblobs/bb/y.enc\n" {
 		t.Errorf("blob list = %q", f.lists[0])
 	}
 	// Then the own files.
-	assertCmd(t, f.cmds[1], dir, []string{"copy", dir, "gdrive:vault", "--files-from", f.paths[1], "--no-traverse"})
+	assertCmd(t, f.cmds[1], dir, []string{"copy", dir, "gdrive:vault", "--files-from", f.paths[1], "--no-traverse", "--ask-password=false"})
 	wantOwn := strings.Join([]string{
 		".gitattributes",
 		"machines/" + mid + ".json.enc",
@@ -218,6 +220,87 @@ func TestRclonePushBlobsFirstThenOwnFiles(t *testing.T) {
 	}
 }
 
+// TestRcloneOwnFilesGlobMetacharsInVaultDir guards against expanding
+// OwnFiles by globbing the absolute vault path: a vault directory whose name
+// contains glob metacharacters matched nothing, so the machine's own files
+// were silently never pushed.
+func TestRcloneOwnFilesGlobMetacharsInVaultDir(t *testing.T) {
+	names := []string{"v [1]", "Vault [work]"}
+	if runtime.GOOS != "windows" {
+		names = append(names, "v*q", "v?", "v\\[x")
+	}
+	for _, name := range names {
+		t.Run(name, func(t *testing.T) {
+			f := newFakeRclone()
+			dir := filepath.Join(t.TempDir(), name)
+			r, err := NewRclone(config.RcloneRemote{Remote: "gdrive", Path: "v"}, dir, Options{MachineID: mid, Runner: f.runner()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			mustWrite(t, dir, "machines/"+mid+".json.enc", "me")
+			mustWrite(t, dir, "machines/"+other+".json.enc", "them")
+			mustWrite(t, dir, "projects/p1/meta/"+mid+".json.enc", "meta")
+			mustWrite(t, dir, "projects/p1/state/"+mid+".json.enc", "state")
+			mustWrite(t, dir, "projects/p1/state/"+other+".json.enc", "their state")
+			mustWrite(t, dir, "vault.json", `{"id":"v"}`)
+			if err := os.MkdirAll(filepath.Join(dir, "projects", "dirnotfile", "meta", mid+".json.enc"), 0o700); err != nil {
+				t.Fatal(err) // a directory with an own-file name is not pushed
+			}
+			if err := r.Push(context.Background(), nil, testLog(t)); err != nil {
+				t.Fatal(err)
+			}
+			if len(f.cmds) != 1 {
+				t.Fatalf("got %d commands, want 1", len(f.cmds))
+			}
+			assertCmd(t, f.cmds[0], dir, []string{"copy", dir, "gdrive:v", "--files-from", f.paths[0], "--no-traverse", "--ask-password=false"})
+			want := strings.Join([]string{
+				"machines/" + mid + ".json.enc",
+				"projects/p1/meta/" + mid + ".json.enc",
+				"projects/p1/state/" + mid + ".json.enc",
+				"vault.json",
+			}, "\n") + "\n"
+			if f.lists[0] != want {
+				t.Errorf("own list =\n%q\nwant\n%q", f.lists[0], want)
+			}
+		})
+	}
+}
+
+// TestRcloneWrittenBlobsMissingLoggedOnce: a missing blob listed several
+// times in written is examined (and reported) once.
+func TestRcloneWrittenBlobsMissingLoggedOnce(t *testing.T) {
+	f := newFakeRclone()
+	r, dir := newRcloneVault(t, f, config.RcloneRemote{Remote: "gdrive", Path: "v"})
+	mustWrite(t, dir, "blobs/aa/present.enc", "x")
+	written := []string{
+		"blobs/zz/missing.enc",
+		"blobs/zz/missing.enc",
+		"./blobs/zz/missing.enc",
+		filepath.Join(dir, "blobs", "zz", "missing.enc"),
+		"blobs/aa/present.enc",
+		"blobs/aa/present.enc",
+	}
+	var lines []string
+	if err := r.Push(context.Background(), written, func(s string) { lines = append(lines, s) }); err != nil {
+		t.Fatal(err)
+	}
+	skips := 0
+	for _, l := range lines {
+		if strings.HasPrefix(l, "skipping missing blob ") {
+			skips++
+			if l != "skipping missing blob blobs/zz/missing.enc" {
+				t.Errorf("unexpected skip line %q", l)
+			}
+		}
+	}
+	if skips != 1 {
+		t.Errorf("missing blob logged %d times, want 1:\n%s", skips, strings.Join(lines, "\n"))
+	}
+	if len(f.cmds) != 1 || f.lists[0] != "blobs/aa/present.enc\n" {
+		t.Errorf("blob push = %d calls, list %q", len(f.cmds), f.lists)
+	}
+}
+
 func TestRclonePushWithoutBlobs(t *testing.T) {
 	f := newFakeRclone()
 	r, dir := newRcloneVault(t, f, config.RcloneRemote{Remote: "gdrive", Path: "v"})
@@ -228,7 +311,7 @@ func TestRclonePushWithoutBlobs(t *testing.T) {
 	if len(f.cmds) != 1 {
 		t.Fatalf("got %d commands, want 1", len(f.cmds))
 	}
-	assertCmd(t, f.cmds[0], dir, []string{"copy", dir, "gdrive:v", "--files-from", f.paths[0], "--no-traverse"})
+	assertCmd(t, f.cmds[0], dir, []string{"copy", dir, "gdrive:v", "--files-from", f.paths[0], "--no-traverse", "--ask-password=false"})
 	if f.lists[0] != "machines/"+mid+".json.enc\n" {
 		t.Errorf("list = %q", f.lists[0])
 	}
@@ -269,18 +352,87 @@ func TestRclonePushStopsOnBlobFailure(t *testing.T) {
 }
 
 func TestRclonePrepare(t *testing.T) {
-	f := newFakeRclone()
-	r, dir := newRcloneVault(t, f, config.RcloneRemote{Remote: "gdrive", Path: "backup/vault"})
-	if err := r.Prepare(context.Background(), testLog(t)); err != nil {
-		t.Fatal(err)
+	const (
+		statDir  = `{"Path":"","Name":"","Size":-1,"MimeType":"inode/directory","ModTime":"2026-09-05T10:00:00Z","IsDir":true}` + "\n"
+		statFile = `{"Path":"vault","Name":"vault","Size":12,"MimeType":"application/octet-stream","ModTime":"2026-09-05T10:00:00Z","IsDir":false}` + "\n"
+		notFound = "2026/09/05 10:00:00 NOTICE: Failed to lsjson: directory not found\n"
+	)
+	probe := []string{"lsjson", "--stat", "gdrive:backup/vault", "--ask-password=false"}
+	mk := []string{"mkdir", "gdrive:backup/vault", "--ask-password=false"}
+	cases := []struct {
+		name    string
+		stat    execx.Result
+		mkdir   execx.Result
+		want    [][]string
+		wantErr string
+		wantLog string
+	}{
+		{"folder exists", out(statDir), execx.Result{}, [][]string{probe}, "", "vault folder exists on the remote"},
+		{"folder missing", exit(3, notFound), execx.Result{}, [][]string{probe, mk}, "", "vault folder missing on the remote; creating it"},
+		{"file-not-found code", exit(4, "2026/09/05 10:00:00 NOTICE: Failed to lsjson: object not found\n"), execx.Result{}, [][]string{probe, mk}, "", ""},
+		{"path is a file", out(statFile), execx.Result{}, [][]string{probe}, "is a file, not a folder", ""},
+		{"unexpected probe output", out("nope\n"), execx.Result{}, [][]string{probe, mk}, "", "warning: unexpected rclone lsjson output; creating the vault folder anyway"},
+		{"mkdir fails", exit(3, notFound), exit(1, "2026/09/05 10:00:00 Failed to mkdir: boom\n"), [][]string{probe, mk}, "boom", ""},
 	}
-	if len(f.cmds) != 2 {
-		t.Fatalf("got %d commands, want 2", len(f.cmds))
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeRclone()
+			f.script = func(args []string, _ int) (execx.Result, bool) {
+				switch args[0] {
+				case "lsjson":
+					return tc.stat, true
+				case "mkdir":
+					return tc.mkdir, true
+				}
+				return execx.Result{}, false
+			}
+			r, dir := newRcloneVault(t, f, config.RcloneRemote{Remote: "gdrive", Path: "backup/vault"})
+			var lines []string
+			err := r.Prepare(context.Background(), func(s string) { lines = append(lines, s); t.Log(s) })
+			if tc.wantErr == "" && err != nil {
+				t.Fatalf("Prepare: %v", err)
+			}
+			if tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)) {
+				t.Fatalf("Prepare err = %v, want one containing %q", err, tc.wantErr)
+			}
+			if len(f.cmds) != len(tc.want) {
+				t.Fatalf("got %d commands, want %d: %v", len(f.cmds), len(tc.want), f.cmds)
+			}
+			for i, want := range tc.want {
+				assertCmd(t, f.cmds[i], dir, want)
+			}
+			if tc.wantLog != "" && !slices.Contains(lines, tc.wantLog) {
+				t.Errorf("log lacks %q: %v", tc.wantLog, lines)
+			}
+			if st, err := os.Stat(dir); err != nil || st.Mode().Perm() != 0o700 {
+				t.Errorf("vault dir: %v mode %v", err, st)
+			}
+			for _, c := range f.cmds {
+				if slices.Contains(c.Args, "lsd") || slices.Contains(c.Args, "gdrive:") {
+					t.Errorf("Prepare listed the remote root: %q", c.Args)
+				}
+			}
+		})
 	}
-	assertCmd(t, f.cmds[0], dir, []string{"lsd", "gdrive:"})
-	assertCmd(t, f.cmds[1], dir, []string{"mkdir", "gdrive:backup/vault"})
-	if st, err := os.Stat(dir); err != nil || st.Mode().Perm() != 0o700 {
-		t.Errorf("vault dir: %v mode %v", err, st)
+}
+
+func TestStatIsDir(t *testing.T) {
+	cases := []struct {
+		in            string
+		isDir, wantOK bool
+	}{
+		{`{"Path":"","IsDir":true}`, true, true},
+		{`{"Path":"f","Size":3,"IsDir":false}`, false, true},
+		{`{"Path":"f"}`, false, false},
+		{``, false, false},
+		{`nope`, false, false},
+		{`[]`, false, false},
+	}
+	for _, tc := range cases {
+		isDir, ok := statIsDir([]byte(tc.in))
+		if isDir != tc.isDir || ok != tc.wantOK {
+			t.Errorf("statIsDir(%q) = %v, %v; want %v, %v", tc.in, isDir, ok, tc.isDir, tc.wantOK)
+		}
 	}
 }
 
@@ -297,6 +449,14 @@ func TestRclonePrepareErrors(t *testing.T) {
 		{"dns", "2026/09/05 Failed to lsd: Get \"https://www.googleapis.com/x\": dial tcp: lookup www.googleapis.com: no such host\n", ErrNetwork, ""},
 		{"refused", "2026/09/05 Failed to lsd: dial tcp 1.2.3.4:443: connect: connection refused\n", ErrNetwork, ""},
 		{"other", "2026/09/05 Failed to lsd: something odd\n", nil, "something odd"},
+		{"digits are not auth", "2026/09/05 Failed to lsd: read 1401 bytes: unexpected EOF\n", nil, "1401 bytes"},
+		{"local permission denied", "2026/09/05 Failed to lsd: open /vault/x: permission denied\n", nil, "permission denied"},
+		{"dropbox expired token", "2026/09/05 Failed to lsd: expired_access_token/\n", ErrAuth, ""},
+		{"s3 access denied", "2026/09/05 Failed to lsd: AccessDenied: Access Denied status code: 403\n", ErrAuth, ""},
+		{"unauthenticated", "2026/09/05 Failed to lsd: rpc error: code = Unauthenticated desc = token invalid\n", ErrAuth, ""},
+		{"encrypted config without password", `2026/09/05 CRITICAL: Failed to load config file "/h/.config/rclone/rclone.conf": unable to decrypt configuration and not allowed to ask for password - set RCLONE_CONFIG_PASS to your configuration password` + "\n", nil, "set RCLONE_CONFIG_PASS"},
+		{"encrypted config wrong password", "2026/09/05 ERROR : Couldn't decrypt configuration, most likely wrong password.\n2026/09/05 CRITICAL: Failed to load config file \"/h/rclone.conf\": unable to decrypt configuration and not allowed to ask for password - set RCLONE_CONFIG_PASS to your configuration password\n", nil, "most likely wrong password"},
+		{"config password prompt hit EOF", "Enter configuration password:\npassword:2026/09/05 CRITICAL: Failed to read line: EOF\n", nil, "set RCLONE_CONFIG_PASS"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -310,7 +470,12 @@ func TestRclonePrepareErrors(t *testing.T) {
 				t.Fatal("Prepare succeeded")
 			}
 			if len(f.cmds) != 1 {
-				t.Errorf("mkdir attempted after lsd failure")
+				t.Errorf("mkdir attempted after the probe failed")
+			}
+			if tc.contain == "set RCLONE_CONFIG_PASS" || tc.contain == "most likely wrong password" {
+				if !strings.Contains(err.Error(), "RCLONE_CONFIG_PASS") || errors.Is(err, ErrAuth) {
+					t.Errorf("encrypted config error = %v: want the RCLONE_CONFIG_PASS hint and no ErrAuth", err)
+				}
 			}
 			for _, s := range []error{ErrAuth, ErrNetwork} {
 				if errors.Is(err, s) != (tc.want == s) {
@@ -341,7 +506,7 @@ func TestRcloneStderrIsLogged(t *testing.T) {
 	if !slices.Contains(lines, "rclone: Transferred: 1 / 1") {
 		t.Errorf("stderr not streamed to log: %v", lines)
 	}
-	if !slices.Contains(lines, "$ rclone lsd gdrive:") {
+	if !slices.Contains(lines, "$ rclone lsjson --stat gdrive:v --ask-password=false") {
 		t.Errorf("command not logged: %v", lines)
 	}
 }

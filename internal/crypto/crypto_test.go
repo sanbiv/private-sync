@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -21,7 +23,7 @@ const (
 	// Argon2id(passphrase="correct horse battery staple", salt=0xA0..0xAF, t=1, m=8192 KiB, p=1).
 	katKEK = "69c063433c5ed8277914f61461e8d8e3635e6c10a68fc75aca95b069ef25c71c"
 	// vault.json wrapped_key: seal(katKEK, nonce=0x10..0x27, aad=katWrappedAAD, fixedVK()).
-	katWrappedAAD = "vault-key:0123456789abcdef"
+	katWrappedAAD = VaultKeyAADPrefix + "0123456789abcdef"
 	katWrapped    = "50535631101112131415161718191a1b1c1d1e1f20212223242526279e5c59c2402bcfb30791e389e34a3415023667dbaecf1290252081f63e05bb85a17092d0d79af3a9ad0d6db1941a52f9"
 	// Project id: hex(HMAC-SHA256(katMac, "project:"+katProjectFP))[:16].
 	katProjectFP      = "git:github.com/sanbiv/private-sync"
@@ -184,7 +186,7 @@ func TestSealBlobDeterministic(t *testing.T) {
 		if err != nil {
 			t.Fatalf("OpenBlob(%d bytes): %v", len(pt), err)
 		}
-		if !bytes.Equal(back, pt) && !(len(back) == 0 && len(pt) == 0) {
+		if !bytes.Equal(back, pt) {
 			t.Errorf("round trip mismatch for %d-byte plaintext", len(pt))
 		}
 	}
@@ -291,7 +293,6 @@ func TestDocRoundTrip(t *testing.T) {
 		pt  []byte
 	}{
 		{"journals/abc.enc", []byte(`{"seq":1}`)},
-		{"", []byte("no aad")},
 		{"trash:0123", nil},
 		{"machines/x", bytes.Repeat([]byte("z"), 10000)},
 	} {
@@ -309,7 +310,7 @@ func TestDocRoundTrip(t *testing.T) {
 		if err != nil {
 			t.Fatalf("OpenDoc(%q): %v", tc.aad, err)
 		}
-		if !bytes.Equal(back, tc.pt) && !(len(back) == 0 && len(tc.pt) == 0) {
+		if !bytes.Equal(back, tc.pt) {
 			t.Errorf("OpenDoc(%q) mismatch", tc.aad)
 		}
 	}
@@ -347,7 +348,7 @@ func TestOpenDocFailures(t *testing.T) {
 		want error
 	}{
 		{"moved file (wrong path AAD)", "journals/b.enc", ct, ErrAuth},
-		{"empty AAD", "", ct, ErrAuth},
+		{"empty AAD", "", ct, ErrAAD},
 		{"tampered", "journals/a.enc", func() []byte {
 			c := bytes.Clone(ct)
 			c[HeaderSize] ^= 1
@@ -364,7 +365,9 @@ func TestOpenDocFailures(t *testing.T) {
 			}
 		})
 	}
-	// Blob and doc formats are not interchangeable via AAD confusion.
+	// Blob and doc use the same construction; domain separation comes only
+	// from the AAD prefix ("blob:" vs path/"trash:"), so the blob opens under
+	// its blob AAD and fails without the prefix.
 	id, bct, _ := k.SealBlob([]byte("payload"))
 	if _, err := k.OpenDoc("blob:"+id, bct); err != nil {
 		t.Errorf("OpenDoc with blob AAD should work (same construction): %v", err)
@@ -383,7 +386,7 @@ func TestWrapUnwrapKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const aad = "vault-key:0123456789abcdef"
+	const aad = VaultKeyAADPrefix + "0123456789abcdef"
 
 	wrapped, err := WrapKey(kek, vk, aad)
 	if err != nil {
@@ -565,23 +568,13 @@ func TestDeriveKEKZeroesPassphrase(t *testing.T) {
 	if got := hex.EncodeToString(kek); got != katKEK {
 		t.Errorf("KEK = %s, want %s", got, katKEK)
 	}
-	// Zeroed even when validation rejects the parameters.
-	pw = []byte("secret")
-	bad := cheapKDF()
-	bad.Time = 0
-	if _, err := DeriveKEK(pw, bad); !errors.Is(err, ErrKDFParams) {
-		t.Fatalf("err = %v, want ErrKDFParams", err)
-	}
-	if !bytes.Equal(pw, make([]byte, len(pw))) {
-		t.Errorf("passphrase not zeroed on validation failure: %q", pw)
-	}
-	// A second derivation from the (now zeroed) buffer is a different key,
-	// i.e. the wipe really happened at the byte level.
+	// A second derivation from the (now zeroed) buffer derives like an
+	// all-zero passphrase, i.e. the wipe really happened at the byte level.
 	again, err := DeriveKEK(pw, cheapKDF())
 	if err != nil {
 		t.Fatal(err)
 	}
-	empty, err := DeriveKEK(make([]byte, 6), cheapKDF())
+	empty, err := DeriveKEK(make([]byte, len(pw)), cheapKDF())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -680,9 +673,14 @@ func TestKeyedID(t *testing.T) {
 	if k.KeyedID("", nil) != hex.EncodeToString(hmacSHA256(k.mac, nil)) {
 		t.Error("empty KeyedID mismatch")
 	}
-	if a == k.BlobID([]byte("project:fp")) {
-		// Same construction by design: both are HMAC(mac, bytes). Document it.
-		t.Log("KeyedID and BlobID share the mac key (expected; labels keep domains apart)")
+	// Same construction by design: both are hex(HMAC(mac, bytes)) and the
+	// label is a plain prefix, so KeyedID("", p) == BlobID(p) and
+	// KeyedID(label, data) == BlobID(label||data). Labels keep the domains apart.
+	if got := k.KeyedID("", []byte("project:fp")); got != k.BlobID([]byte("project:fp")) {
+		t.Errorf("KeyedID(\"\", p) = %s != BlobID(p) = %s", got, k.BlobID([]byte("project:fp")))
+	}
+	if a != k.BlobID([]byte("project:fp")) {
+		t.Error("KeyedID(label, data) != BlobID(label||data)")
 	}
 	other := mustKeys(t, append([]byte{1}, fixedVK()[1:]...))
 	if a == other.KeyedID("project:", []byte("fp")) {
@@ -982,7 +980,6 @@ func TestDocAADCanonicalForm(t *testing.T) {
 		"journals/abc.enc",
 		"trash:0123456789abcdef",
 		"machines/x",
-		"",
 		"unicode/ünïcødé.enc",
 	}
 	for _, aad := range good {
@@ -1045,5 +1042,313 @@ func TestDocAADCanonicalForm(t *testing.T) {
 	kek := mustHex(t, katKEK)
 	if _, err := WrapKey(kek, fixedVK(), `vault-key:a\b`); err != nil {
 		t.Errorf("WrapKey does not impose path rules: %v", err)
+	}
+}
+
+// Regression: DeriveKEK used to wipe the passphrase even when Validate
+// rejected the parameters (before Argon2id ever ran). A caller retrying with
+// corrected/upgraded KDF parameters after ErrKDFParams then silently derived
+// the all-zero-passphrase KEK. Now the wipe happens only after Argon2id has
+// consumed the passphrase; validation failure leaves it untouched.
+func TestDeriveKEKKeepsPassphraseOnInvalidParams(t *testing.T) {
+	const secret = "correct horse battery staple"
+	for _, tc := range []struct {
+		name   string
+		mutate func(*KDFParams)
+	}{
+		{"time 0", func(p *KDFParams) { p.Time = 0 }},
+		{"memory huge", func(p *KDFParams) { p.Memory = ^uint32(0) }},
+		{"threads 0", func(p *KDFParams) { p.Threads = 0 }},
+		{"wrong algo", func(p *KDFParams) { p.Algo = "scrypt" }},
+		{"short salt", func(p *KDFParams) { p.Salt = p.Salt[:8] }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pw := []byte(secret)
+			bad := cheapKDF()
+			tc.mutate(&bad)
+			kek, err := DeriveKEK(pw, bad)
+			if !errors.Is(err, ErrKDFParams) {
+				t.Fatalf("err = %v, want ErrKDFParams", err)
+			}
+			if kek != nil {
+				t.Errorf("kek returned on validation failure")
+			}
+			if string(pw) != secret {
+				t.Fatalf("passphrase modified on validation failure: %q", pw)
+			}
+			// Retrying with corrected parameters yields the real KEK, not the
+			// all-zero-passphrase one, and only then is the buffer wiped.
+			kek, err = DeriveKEK(pw, cheapKDF())
+			if err != nil {
+				t.Fatalf("retry: %v", err)
+			}
+			if got := hex.EncodeToString(kek); got != katKEK {
+				t.Errorf("retry KEK = %s, want %s (passphrase was lost)", got, katKEK)
+			}
+			if !bytes.Equal(pw, make([]byte, len(pw))) {
+				t.Errorf("passphrase not zeroed after successful derivation: %q", pw)
+			}
+		})
+	}
+}
+
+// Regression: Keys had no synchronisation, so Zero racing with SealBlob/
+// OpenDoc on another goroutine was a data race (ready() could pass and then
+// the AEAD read a half-wiped or nil key, surfacing as ErrKeySize/ErrAuth).
+// Every reader now shares a read lock and Zero takes the write lock: an
+// operation either completes with the intact keys or fails with the
+// not-ready sentinel — never ErrAuth, ErrKeySize or a panic. Run with -race.
+func TestKeysZeroConcurrentWithUse(t *testing.T) {
+	const workers = 8
+	const rounds = 200
+	for round := 0; round < 5; round++ {
+		k := mustKeys(t, fixedVK())
+		pt := []byte(katPlaintext)
+		id, blob, err := k.SealBlob(pt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		doc, err := k.SealDoc("journals/a.enc", pt)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		var (
+			start sync.WaitGroup
+			done  sync.WaitGroup
+			mu    sync.Mutex
+			bad   []string
+		)
+		record := func(format string, args ...any) {
+			mu.Lock()
+			bad = append(bad, fmt.Sprintf(format, args...))
+			mu.Unlock()
+		}
+		start.Add(1)
+		for w := 0; w < workers; w++ {
+			done.Add(1)
+			go func(w int) {
+				defer done.Done()
+				start.Wait()
+				for i := 0; i < rounds; i++ {
+					switch (w + i) % 6 {
+					case 0:
+						if got := k.BlobID(pt); got != "" && got != katBlobID {
+							record("BlobID = %s", got)
+						}
+					case 1:
+						gotID, ct, err := k.SealBlob(pt)
+						if err != nil {
+							if !errors.Is(err, errKeysNotReady) {
+								record("SealBlob: %v", err)
+							}
+						} else if gotID != katBlobID || hex.EncodeToString(ct) != katBlob {
+							record("SealBlob produced wrong output under concurrency")
+						}
+					case 2:
+						back, err := k.OpenBlob(id, blob)
+						if err != nil {
+							if !errors.Is(err, errKeysNotReady) {
+								record("OpenBlob: %v", err)
+							}
+						} else if string(back) != katPlaintext {
+							record("OpenBlob = %q", back)
+						}
+					case 3:
+						back, err := k.OpenDoc("journals/a.enc", doc)
+						if err != nil {
+							if !errors.Is(err, errKeysNotReady) {
+								record("OpenDoc: %v", err)
+							}
+						} else if string(back) != katPlaintext {
+							record("OpenDoc = %q", back)
+						}
+					case 4:
+						if _, err := k.SealDoc("journals/b.enc", pt); err != nil && !errors.Is(err, errKeysNotReady) {
+							record("SealDoc: %v", err)
+						}
+					case 5:
+						if got := k.ProjectID(katProjectFP); got != "" && got != katProjectID {
+							record("ProjectID = %s", got)
+						}
+						if got := k.KeyedID(ProjectIDPrefix, []byte(katProjectFP)); got != "" && got != katProjectKeyedID {
+							record("KeyedID = %s", got)
+						}
+					}
+				}
+			}(w)
+		}
+		// Zero from several goroutines at once, mid-flight.
+		for z := 0; z < 3; z++ {
+			done.Add(1)
+			go func() {
+				defer done.Done()
+				start.Wait()
+				k.Zero()
+			}()
+		}
+		start.Done()
+		done.Wait()
+
+		for _, b := range bad {
+			t.Error(b)
+		}
+		if k.ready() {
+			t.Error("keys still ready after concurrent Zero")
+		}
+		if _, _, err := k.SealBlob(pt); !errors.Is(err, errKeysNotReady) {
+			t.Errorf("after Zero: err = %v, want errKeysNotReady", err)
+		}
+	}
+}
+
+// Concurrent readers alone must not block each other or corrupt output.
+func TestKeysConcurrentReaders(t *testing.T) {
+	k := mustKeys(t, fixedVK())
+	defer k.Zero()
+	pt := []byte(katPlaintext)
+	var wg sync.WaitGroup
+	errs := make(chan error, 64)
+	for w := 0; w < 16; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 50; i++ {
+				id, ct, err := k.SealBlob(pt)
+				if err != nil {
+					errs <- err
+					return
+				}
+				if id != katBlobID || hex.EncodeToString(ct) != katBlob {
+					errs <- errors.New("nondeterministic SealBlob under concurrency")
+					return
+				}
+				if _, err := k.OpenBlob(id, ct); err != nil {
+					errs <- err
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+}
+
+// The wrapped-key AAD prefix is part of the on-disk format (vault.json);
+// freeze its value next to the other format constants.
+func TestFormatConstants(t *testing.T) {
+	if VaultKeyAADPrefix != "vault-key:" {
+		t.Errorf("VaultKeyAADPrefix = %q, want \"vault-key:\"", VaultKeyAADPrefix)
+	}
+	if BlobAADPrefix != "blob:" {
+		t.Errorf("BlobAADPrefix = %q, want \"blob:\"", BlobAADPrefix)
+	}
+	if ProjectIDPrefix != "project:" {
+		t.Errorf("ProjectIDPrefix = %q, want \"project:\"", ProjectIDPrefix)
+	}
+	if InfoPrefix != "private-sync/v1/" {
+		t.Errorf("InfoPrefix = %q", InfoPrefix)
+	}
+	if Magic != "PSV1" || KeySize != 32 || NonceSize != 24 || SaltSize != 16 || TagSize != 16 {
+		t.Errorf("format sizes drifted: magic %q key %d nonce %d salt %d tag %d", Magic, KeySize, NonceSize, SaltSize, TagSize)
+	}
+	if HeaderSize != 28 || MinCiphertextSize != 44 || ProjectIDLen != 16 {
+		t.Errorf("derived sizes drifted: header %d min %d projectid %d", HeaderSize, MinCiphertextSize, ProjectIDLen)
+	}
+	// The KAT AAD is built from the constant, so a vault.json wrapped with
+	// the literal prefix still unwraps.
+	if katWrappedAAD != "vault-key:0123456789abcdef" {
+		t.Errorf("katWrappedAAD = %q", katWrappedAAD)
+	}
+}
+
+// Regression: spec §4 binds every document to its vault-relative path or
+// "trash:"+id. An empty AAD used to be accepted, which silently dropped the
+// move-protection binding: a caller bug passing an unset path still produced
+// a valid-looking PSV1 file. Both SealDoc and OpenDoc must now refuse it with
+// ErrAAD, before any AEAD work and without ever reporting ErrAuth.
+func TestDocAADEmptyRejected(t *testing.T) {
+	k := mustKeys(t, fixedVK())
+	pt := []byte(`{"seq":1}`)
+
+	ct, err := k.SealDoc("", pt)
+	if !errors.Is(err, ErrAAD) {
+		t.Errorf("SealDoc(\"\"): err = %v, want ErrAAD", err)
+	}
+	if errors.Is(err, ErrAuth) || errors.Is(err, ErrFormat) {
+		t.Errorf("SealDoc(\"\"): err = %v, must not be ErrAuth/ErrFormat", err)
+	}
+	if ct != nil {
+		t.Error("SealDoc(\"\") returned ciphertext on error")
+	}
+	if err == nil || !strings.Contains(err.Error(), "empty") {
+		t.Errorf("SealDoc(\"\") error does not explain itself: %v", err)
+	}
+
+	// A properly bound document cannot be opened with the binding stripped,
+	// and the failure is the programming-error kind (ErrAAD), not ErrAuth.
+	good, err := k.SealDoc("journals/a.enc", pt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := k.OpenDoc("", good)
+	if !errors.Is(err, ErrAAD) || errors.Is(err, ErrAuth) {
+		t.Errorf("OpenDoc(\"\"): err = %v, want ErrAAD only", err)
+	}
+	if got != nil {
+		t.Error("OpenDoc(\"\") returned plaintext on error")
+	}
+
+	// Garbage input with an empty AAD is still ErrAAD: the guard runs before
+	// the format check so callers get the most actionable error.
+	for _, in := range [][]byte{nil, {}, bytes.Repeat([]byte{1}, 100)} {
+		if _, err := k.OpenDoc("", in); !errors.Is(err, ErrAAD) {
+			t.Errorf("OpenDoc(\"\", %d bytes): err = %v, want ErrAAD", len(in), err)
+		}
+	}
+
+	// Whitespace-only is not empty and is left to the caller (it is still a
+	// distinct binding), so the guard must not over-reach.
+	if _, err := k.SealDoc(" ", pt); err != nil {
+		t.Errorf("SealDoc(\" \"): unexpected err %v", err)
+	}
+}
+
+// Regression for the reworded TestOpenDocFailures comment: blob and doc share
+// one seal construction and are separated only by their AAD prefixes. Pin
+// that down explicitly so the two domains can never collide silently: a doc
+// sealed under a path never opens as a blob, and a blob never opens as a doc
+// under its bare id.
+func TestBlobDocDomainSeparation(t *testing.T) {
+	k := mustKeys(t, fixedVK())
+	pt := []byte("payload")
+
+	id, bct, err := k.SealBlob(pt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Same construction: the blob opens as a doc under the full blob AAD...
+	if back, err := k.OpenDoc(BlobAADPrefix+id, bct); err != nil || !bytes.Equal(back, pt) {
+		t.Errorf("OpenDoc(blob AAD): %v", err)
+	}
+	// ...but not under its bare id or under a trash binding.
+	for _, aad := range []string{id, "trash:" + id, "blobs/" + id} {
+		if _, err := k.OpenDoc(aad, bct); !errors.Is(err, ErrAuth) {
+			t.Errorf("OpenDoc(%q, blob ct): err = %v, want ErrAuth", aad, err)
+		}
+	}
+
+	// A doc sealed under a path never opens as a blob, whatever id is tried.
+	dct, err := k.SealDoc("journals/a.enc", pt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tryID := range []string{id, k.BlobID(pt), "journals/a.enc"} {
+		if _, err := k.OpenBlob(tryID, dct); !errors.Is(err, ErrAuth) {
+			t.Errorf("OpenBlob(%q, doc ct): err = %v, want ErrAuth", tryID, err)
+		}
 	}
 }

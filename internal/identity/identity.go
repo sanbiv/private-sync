@@ -187,14 +187,16 @@ func matchLevel(f Fingerprint) Level {
 }
 
 // Strongest returns the first level-1 fingerprint, else the first level-2 one.
+// Fingerprints are classified exactly as MatchProjects does (matchLevel), so a
+// list that matches strongly always yields a strongest fingerprint.
 func Strongest(fps []Fingerprint) (Fingerprint, bool) {
 	for _, f := range fps {
-		if f.Level == LevelStrong {
+		if matchLevel(f) == LevelStrong {
 			return f, true
 		}
 	}
 	for _, f := range fps {
-		if f.Level == LevelPackage {
+		if matchLevel(f) == LevelPackage {
 			return f, true
 		}
 	}
@@ -231,25 +233,12 @@ func NormalizeGitURL(raw string) (string, bool) {
 		if strings.HasPrefix(s, "/") || strings.HasPrefix(s, ".") || strings.HasPrefix(s, "~") || strings.HasPrefix(s, "\\") {
 			return "", false
 		}
-		slash := strings.Index(s, "/")
-		// User info ("user[:password]@") may itself contain a colon, so locate
-		// its terminator first: the last '@' before the first '/'.
-		at := -1
-		if slash >= 0 {
-			at = strings.LastIndex(s[:slash], "@")
-		} else {
-			at = strings.LastIndex(s, "@")
-		}
-		colon := -1
-		if i := strings.Index(s[at+1:], ":"); i >= 0 {
-			colon = at + 1 + i
-		}
-		if colon < 0 || (slash >= 0 && slash < colon) {
+		h, p, ok := splitSCP(s)
+		if !ok {
 			// no host:path separator → a local path.
 			return "", false
 		}
-		authority, p := s[:colon], s[colon+1:]
-		host = stripUserInfo(authority)
+		host = h
 		if len(host) == 1 && host[0] >= 'a' && host[0] <= 'z' {
 			// Windows drive letter (c:\repo, c:/repo).
 			return "", false
@@ -309,6 +298,54 @@ func Union(lists ...[]Fingerprint) []Fingerprint {
 		}
 	}
 	return out
+}
+
+// splitSCP splits an scp-like remote "[user[:password]@]host:path" into host
+// and path. The user info may contain ':' (a password) and the path may
+// contain '@' and ':', so the user-info terminator is found by trying every
+// '@' that precedes the first '/' (user info never contains a slash), then the
+// no-user-info case, and accepting the first candidate that yields a host: a
+// non-empty run without '/', '@' or ':' (or a bracketed IPv6 literal) that is
+// immediately followed by ':'.
+func splitSCP(s string) (host, path string, ok bool) {
+	head := s
+	if slash := strings.IndexByte(s, '/'); slash >= 0 {
+		head = s[:slash]
+	}
+	var candidates []int
+	for i := 0; i < len(head); i++ {
+		if head[i] == '@' {
+			candidates = append(candidates, i)
+		}
+	}
+	candidates = append(candidates, -1)
+	for _, at := range candidates {
+		rest := s[at+1:]
+		var h string
+		var colon int
+		if strings.HasPrefix(rest, "[") {
+			// Bracketed IPv6 literal: the separator is the ':' right after ']'.
+			end := strings.Index(rest, "]:")
+			if end < 2 {
+				continue
+			}
+			h, colon = rest[:end+1], end+1
+			if strings.ContainsAny(h[1:end], "/@[]") {
+				continue
+			}
+		} else {
+			colon = strings.IndexByte(rest, ':')
+			if colon < 0 {
+				continue
+			}
+			h = rest[:colon]
+			if h == "" || strings.ContainsAny(h, "/@[]") {
+				continue
+			}
+		}
+		return h, rest[colon+1:], true
+	}
+	return "", "", false
 }
 
 // stripUserInfo removes "user[:password]@" from an authority component.

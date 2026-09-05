@@ -5,7 +5,9 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -29,6 +31,20 @@ func testDirs(home string) paths.Dirs {
 		Config: filepath.Join(home, ".config", "private-sync"),
 		State:  filepath.Join(home, ".local", "state", "private-sync"),
 	}
+}
+
+// abs turns a rooted test path such as "/srv/other" into a path that
+// isStablePath accepts on every platform. On Unix it is returned cleaned; on
+// Windows a volume-less rooted path is drive-relative (filepath.IsAbs is false),
+// so filepath.Abs prepends the current drive exactly like paths.ExpandHome
+// does. It never fails on the fixtures used here; a failure would mean the
+// working directory is unreadable, which every test would report anyway.
+func abs(p string) string {
+	a, err := filepath.Abs(p)
+	if err != nil {
+		return filepath.Clean(p)
+	}
+	return a
 }
 
 // valid returns a fully populated, valid config rooted under home.
@@ -57,7 +73,7 @@ func valid() *Config {
 		},
 		Projects: []ProjectConfig{
 			{ID: "3f2a9c1e5b7d0a46", Name: "myapp", Path: "~/Work/myapp"},
-			{ID: "aaaa000011112222", Name: "Other", Path: "/srv/other"},
+			{ID: "aaaa000011112222", Name: "Other", Path: abs("/srv/other")},
 		},
 	}
 }
@@ -274,15 +290,15 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	if runtime.GOOS != "windows" {
-		if st.Mode().Perm() != 0o600 {
-			t.Errorf("file mode = %o, want 0600", st.Mode().Perm())
+		if st.Mode().Perm() != FileMode {
+			t.Errorf("file mode = %o, want %o (FileMode)", st.Mode().Perm(), FileMode)
 		}
 		dst, err := os.Stat(dir)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if dst.Mode().Perm() != 0o700 {
-			t.Errorf("dir mode = %o, want 0700", dst.Mode().Perm())
+		if dst.Mode().Perm() != DirMode {
+			t.Errorf("dir mode = %o, want %o (DirMode)", dst.Mode().Perm(), DirMode)
 		}
 	}
 	raw, err := os.ReadFile(p)
@@ -327,6 +343,43 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	}
 	if again.Machine.Name != "other" {
 		t.Errorf("after overwrite Machine.Name = %q, want other", again.Machine.Name)
+	}
+}
+
+// The exported mode constants are the spec'd values (0600 file, 0700 dir) and
+// Save must create the whole missing parent chain with DirMode, not with
+// whatever a helper happens to hard-code.
+func TestSaveModes(t *testing.T) {
+	if FileMode != 0o600 {
+		t.Errorf("FileMode = %o, want 0600", FileMode)
+	}
+	if DirMode != 0o700 {
+		t.Errorf("DirMode = %o, want 0700", DirMode)
+	}
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permission bits are not honoured on Windows")
+	}
+	setHome(t)
+	root := t.TempDir()
+	dir := filepath.Join(root, "nested", "private-sync")
+	if err := valid().Save(filepath.Join(dir, "config.yaml")); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	for _, d := range []string{filepath.Join(root, "nested"), dir} {
+		st, err := os.Stat(d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st.Mode().Perm() != DirMode {
+			t.Errorf("%s mode = %o, want %o (DirMode)", d, st.Mode().Perm(), DirMode)
+		}
+	}
+	st, err := os.Stat(filepath.Join(dir, "config.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode().Perm() != FileMode {
+		t.Errorf("file mode = %o, want %o (FileMode)", st.Mode().Perm(), FileMode)
 	}
 }
 
@@ -452,6 +505,24 @@ func TestValidate(t *testing.T) {
 		{"nil-safe empty projects", func(c *Config) { c.Projects = nil }, ""},
 		{"empty vault path", func(c *Config) { c.Vault.Path = "" }, "vault.path"},
 		{"blank vault path", func(c *Config) { c.Vault.Path = "   " }, "vault.path"},
+		{"relative vault path", func(c *Config) { c.Vault.Path = "vault" }, "vault.path: \"vault\" must be absolute or start with ~/"},
+		{"dot-relative vault path", func(c *Config) { c.Vault.Path = "./vault" }, "vault.path"},
+		{"parent-relative vault path", func(c *Config) { c.Vault.Path = "../vault" }, "vault.path"},
+		{"tilde-user vault path is not expanded", func(c *Config) { c.Vault.Path = "~bob/vault" }, "vault.path"},
+		{"bare tilde vault path", func(c *Config) {
+			c.Vault.Path = "~"
+			c.Key.File.Path = abs("/etc/private-sync/key") // otherwise it sits inside the vault
+		}, ""},
+		{"absolute vault path", func(c *Config) { c.Vault.Path = abs("/srv/vault") }, ""},
+		{"relative key file path", func(c *Config) { c.Key.File.Path = "key" }, "key.file.path: \"key\" must be absolute or start with ~/"},
+		{"relative key file path with prompt source", func(c *Config) {
+			c.Key.Source = KeyPrompt
+			c.Key.File.Path = "./key"
+		}, "key.file.path"},
+		{"absolute key file path", func(c *Config) { c.Key.File.Path = abs("/etc/private-sync/key") }, ""},
+		{"relative project path", func(c *Config) { c.Projects[0].Path = "Work/myapp" }, "projects[0] (myapp [3f2a9c1e5b7d0a46]): path \"Work/myapp\" must be absolute or start with ~/"},
+		{"dot-relative project path", func(c *Config) { c.Projects[1].Path = "./other" }, "projects[1]"},
+		{"absolute project path", func(c *Config) { c.Projects[0].Path = abs("/opt/myapp") }, ""},
 		{"remote none ok without details", func(c *Config) {
 			c.Vault.Remote = RemoteConfig{Type: RemoteNone}
 		}, ""},
@@ -547,6 +618,61 @@ func TestValidate(t *testing.T) {
 	}
 }
 
+// A relative key file (or vault) path is reported once, as a relative-path
+// error, and must never also trigger the inside-vault check: that check would
+// expand the relative path against the working directory, so running the
+// command from inside the vault would add a second, misleading error.
+func TestValidateRelativePathsNotResolvedAgainstCwd(t *testing.T) {
+	home := setHome(t)
+	vault := filepath.Join(home, ".local", "share", "private-sync", "vault")
+	if err := os.MkdirAll(vault, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name string
+		cwd  string
+		mut  func(c *Config)
+		want string // the one expected error key
+	}{
+		{"relative key file, cwd inside vault", vault, func(c *Config) { c.Key.File.Path = "key" }, "key.file.path"},
+		{"relative key file, cwd is vault", vault, func(c *Config) { c.Key.File.Path = "." }, "key.file.path"},
+		{"relative vault, cwd is parent of the key file", filepath.Dir(vault), func(c *Config) {
+			c.Vault.Path = "."
+			c.Key.File.Path = filepath.Join(vault, "key")
+		}, "vault.path"},
+		{"both relative", vault, func(c *Config) {
+			c.Vault.Path = "vault"
+			c.Key.File.Path = "vault/key"
+		}, "vault.path"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Chdir(tc.cwd)
+			c := valid()
+			tc.mut(c)
+			err := c.Validate()
+			if err == nil {
+				t.Fatal("expected an error")
+			}
+			msg := err.Error()
+			if !strings.Contains(msg, tc.want) || !strings.Contains(msg, "must be absolute or start with ~/") {
+				t.Errorf("err = %v, want a relative-path error for %s", err, tc.want)
+			}
+			if strings.Contains(msg, "inside vault.path") {
+				t.Errorf("err = %v, must not contain the cwd-dependent inside-vault error", err)
+			}
+		})
+	}
+	// Control: with both paths stable the inside-vault check still fires,
+	// regardless of the working directory.
+	t.Chdir(home)
+	c := valid()
+	c.Key.File.Path = "~/.local/share/private-sync/vault/key"
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "inside vault.path") {
+		t.Errorf("stable paths: err = %v, want inside-vault error", err)
+	}
+}
+
 func TestValidateMultipleErrorsReported(t *testing.T) {
 	setHome(t)
 	c := valid()
@@ -608,7 +734,7 @@ func TestWarnings(t *testing.T) {
 			c.Key.File.Path = "~/Work/myapp/.secrets/key"
 		}, []string{"key file ~/Work/myapp/.secrets/key is inside project myapp"}},
 		{"key file inside project via absolute path", func(c *Config) {
-			c.Key.File.Path = "/srv/other/key"
+			c.Key.File.Path = abs("/srv/other/key")
 		}, []string{"inside project Other"}},
 		{"key file equal to project dir", func(c *Config) {
 			c.Key.File.Path = "~/Work/myapp"
@@ -651,6 +777,76 @@ func TestWarnings(t *testing.T) {
 	}
 }
 
+// Warnings must not resolve relative paths against the working directory:
+// they are hard errors in Validate, and a cwd-dependent warning would be
+// misleading (and differ between a shell and cron).
+func TestWarningsSkipUnstablePaths(t *testing.T) {
+	home := setHome(t)
+	proj := filepath.Join(home, "Work", "myapp")
+	if err := os.MkdirAll(proj, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(proj)
+	tests := []struct {
+		name string
+		mut  func(c *Config)
+	}{
+		{"relative key file inside cwd project", func(c *Config) { c.Key.File.Path = "key" }},
+		{"relative project path equal to a stable one", func(c *Config) { c.Projects[1].Path = "." }},
+		{"relative vault containing a project", func(c *Config) {
+			c.Vault.Path = ".."
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := valid()
+			tc.mut(c)
+			if w := c.Warnings(); len(w) != 0 {
+				t.Errorf("Warnings = %v, want none for an unstable path", w)
+			}
+		})
+	}
+}
+
+// Containment checks fold case on platforms whose default filesystem is
+// case-insensitive (macOS, Windows), so a key file at ~/Vault/key is caught
+// as living inside a vault at ~/vault; elsewhere the comparison is byte-wise.
+func TestIsWithinCase(t *testing.T) {
+	sep := string(filepath.Separator)
+	root := filepath.Clean(sep + "Home" + sep + "Vault")
+	upper := filepath.Join(root, "key")
+	lower := filepath.Join(strings.ToLower(root), "key")
+	if got := isWithin(root, lower); got != caseInsensitivePaths {
+		t.Errorf("isWithin(%q, %q) = %v, want %v on %s", root, lower, got, caseInsensitivePaths, runtime.GOOS)
+	}
+	if got := isWithin(strings.ToLower(root), upper); got != caseInsensitivePaths {
+		t.Errorf("isWithin(%q, %q) = %v, want %v on %s", strings.ToLower(root), upper, got, caseInsensitivePaths, runtime.GOOS)
+	}
+	// Exact-case containment holds everywhere; a sibling never does.
+	if !isWithin(root, upper) {
+		t.Errorf("isWithin(%q, %q) = false, want true", root, upper)
+	}
+	if isWithin(root, root+"2") {
+		t.Errorf("isWithin(%q, %q) = true, want false", root, root+"2")
+	}
+	if runtime.GOOS != "darwin" && runtime.GOOS != "windows" {
+		return
+	}
+	// End to end: Validate reports the key file inside a differently-cased vault.
+	setHome(t)
+	c := valid()
+	c.Vault.Path = "~/.local/share/private-sync/vault"
+	c.Key.File.Path = "~/.local/share/private-sync/VAULT/key"
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "inside vault.path") {
+		t.Errorf("Validate = %v, want inside-vault error for a case-variant path", err)
+	}
+	c = valid()
+	c.Key.File.Path = "~/WORK/MyApp/key"
+	if w := c.Warnings(); len(w) != 1 || !strings.Contains(w[0], "inside project myapp") {
+		t.Errorf("Warnings = %v, want key-inside-project warning for a case-variant path", w)
+	}
+}
+
 func TestParseSize(t *testing.T) {
 	tests := []struct {
 		in      string
@@ -673,9 +869,14 @@ func TestParseSize(t *testing.T) {
 		{"2 mb", 2_000_000, false},
 		{"2 MiB", 2 * 1024 * 1024, false},
 		{"  2MiB  ", 2 * 1024 * 1024, false},
-		{"2M", 2 * 1024 * 1024, false},
-		{"2k", 2048, false},
-		{"1g", 1 << 30, false},
+		// Bare letters are ambiguous (1000 vs 1024) and therefore rejected.
+		{"2M", 0, true},
+		{"2m", 0, true},
+		{"2k", 0, true},
+		{"2K", 0, true},
+		{"1g", 0, true},
+		{"1t", 0, true},
+		{"2 m", 0, true},
 		{"100B", 100, false},
 		{"100 b", 100, false},
 		{".5KiB", 512, false},
@@ -686,6 +887,20 @@ func TestParseSize(t *testing.T) {
 		{"-1", 0, true},
 		{"-2MiB", 0, true},
 		{"1.5", 0, true},
+		{"1.5B", 0, true},
+		// A fraction that does not land on a whole byte is rejected for every
+		// unit, not silently rounded.
+		{"1.0001KB", 0, true},
+		{"1.0005KiB", 0, true},
+		{"0.0000015MB", 0, true},
+		{"1.00000001GiB", 0, true},
+		// Fractions that do land on whole bytes are fine, including ones whose
+		// binary float product carries rounding noise.
+		{"0.1GB", 100_000_000, false},
+		{"0.001MB", 1000, false},
+		{"0.7KB", 700, false},
+		{"1.25KiB", 1280, false},
+		{"0.3GB", 300_000_000, false},
 		{"1.2.3MB", 0, true},
 		{"2 M B", 0, true},
 		{"2MiBs", 0, true},
@@ -816,12 +1031,9 @@ func TestProjectPath(t *testing.T) {
 	if want := filepath.Join(home, "Work", "myapp"); got != want {
 		t.Errorf("ProjectPath = %q, want %q", got, want)
 	}
-	// Compute the expectation the same way ExpandHome does (filepath.Abs), so
-	// the drive letter Windows prepends to a rooted path is accounted for.
-	wantAbs, err := filepath.Abs("/srv/other")
-	if err != nil {
-		t.Fatal(err)
-	}
+	// The fixture path is already absolute on every platform (see abs), and
+	// ExpandHome must hand it back unchanged.
+	wantAbs := abs("/srv/other")
 	got, err = c.ProjectPath("aaaa000011112222")
 	if err != nil || got != wantAbs {
 		t.Errorf("ProjectPath(abs) = %q, %v; want %q", got, err, wantAbs)
@@ -933,7 +1145,7 @@ func TestExample(t *testing.T) {
 	if ex == "" {
 		t.Fatal("Example() is empty")
 	}
-	for _, key := range []string{"version: 1", "machine:", "vault:", "remote:", "type: git", "rclone:", "key:", "source: bitwarden", "bitwarden:", "scan:", "max_file_size: 2MiB", "projects:", "# none | git | rclone", "# prompt | file | bitwarden"} {
+	for _, key := range []string{"version: 1", "machine:", "vault:", "remote:", "type: git", "rclone:", "key:", "source: bitwarden", "bitwarden:", "scan:", "max_file_size: 2MiB", "projects:", "# none | git | rclone", "# prompt | file | bitwarden", "KiB/MiB/GiB"} {
 		if !strings.Contains(ex, key) {
 			t.Errorf("Example() lacks %q", key)
 		}
@@ -950,12 +1162,140 @@ func TestExample(t *testing.T) {
 		t.Errorf("Example config warnings: %v", w)
 	}
 	// Generic yaml decoding must succeed too (no tabs etc).
-	var any map[string]any
-	if err := yaml.Unmarshal([]byte(ex), &any); err != nil {
+	var generic map[string]any
+	if err := yaml.Unmarshal([]byte(ex), &generic); err != nil {
 		t.Errorf("Example() is not valid YAML: %v", err)
 	}
 	if !strings.HasSuffix(ex, "\n") {
 		t.Error("Example() should end with a newline")
+	}
+}
+
+// Relative paths must be rejected on Load as well, with the offending key
+// named, so a hand-edited config cannot silently depend on the working dir.
+func TestLoadRejectsRelativePaths(t *testing.T) {
+	setHome(t)
+	tests := []struct {
+		name string
+		yaml string
+		want string
+	}{
+		{"vault", "vault:\n  path: vault\n", "vault.path"},
+		{"key file", "vault:\n  path: ~/v\nkey:\n  source: file\n  file:\n    path: key\n", "key.file.path"},
+		{"project", "vault:\n  path: ~/v\nprojects:\n  - id: a\n    path: proj\n", "projects[0]"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			p := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(p, []byte(tc.yaml), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := Load(p)
+			if err == nil || !strings.Contains(err.Error(), tc.want) || !strings.Contains(err.Error(), "must be absolute or start with ~/") {
+				t.Fatalf("err = %v, want relative-path error mentioning %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestIsStablePath(t *testing.T) {
+	type row struct {
+		in   string
+		want bool
+	}
+	tests := []row{
+		{"~", true},
+		{"~/", true},
+		{"~/x", true},
+		{"", false},
+		{"x", false},
+		{"./x", false},
+		{"../x", false},
+		{"~x", false},
+		{"~bob/x", false},
+		{" /x", false},
+		{" ~/x", false},
+		// A path that is absolute on this platform is always stable.
+		{abs("/srv/x"), true},
+		{abs("/"), true},
+	}
+	if runtime.GOOS == "windows" {
+		// Volume-less rooted paths are drive-relative on Windows, so they
+		// depend on the current drive and are not stable there; the
+		// drive-rooted and ~\ forms are the stable counterparts.
+		tests = append(tests, row{"/x", false}, row{"/", false}, row{`C:\x`, true}, row{`~\x`, true})
+	} else {
+		tests = append(tests, row{"/x", true}, row{"/", true})
+	}
+	for _, tc := range tests {
+		if got := isStablePath(tc.in); got != tc.want {
+			t.Errorf("isStablePath(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
+// The temp file name must be unique per process and per call, otherwise
+// two writers racing on config.yaml would truncate each other's temp file.
+func TestTempSuffixUnique(t *testing.T) {
+	a, b := tempSuffix(), tempSuffix()
+	if a == b {
+		t.Fatalf("tempSuffix returned the same value twice: %q", a)
+	}
+	pid := strconv.Itoa(os.Getpid())
+	for _, s := range []string{a, b} {
+		if !strings.HasPrefix(s, "cfg-"+pid+"-") {
+			t.Errorf("tempSuffix = %q, want prefix cfg-%s-", s, pid)
+		}
+		if strings.ContainsAny(s, `/\ `) {
+			t.Errorf("tempSuffix %q must be usable as a file name", s)
+		}
+	}
+}
+
+// Concurrent Saves to the same path must each write through their own temp
+// file: the final config.yaml is one complete version and no temp files remain.
+func TestSaveConcurrent(t *testing.T) {
+	setHome(t)
+	dir := t.TempDir()
+	p := filepath.Join(dir, "config.yaml")
+	const n = 16
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			c := valid()
+			c.Machine.Name = "writer-" + strconv.Itoa(i)
+			errs[i] = c.Save(p)
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("writer %d: %v", i, err)
+		}
+	}
+	got, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load after concurrent saves: %v", err)
+	}
+	if !strings.HasPrefix(got.Machine.Name, "writer-") {
+		t.Errorf("Machine.Name = %q, want one of the writers", got.Machine.Name)
+	}
+	want := valid()
+	want.Machine.Name = got.Machine.Name
+	if !equalConfig(got, want) {
+		t.Errorf("final file is not a complete config:\n got %+v\nwant %+v", got, want)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.Name() != "config.yaml" {
+			t.Errorf("unexpected file left behind: %s", e.Name())
+		}
 	}
 }
 

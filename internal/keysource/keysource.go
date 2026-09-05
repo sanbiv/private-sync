@@ -14,6 +14,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"unicode"
 
 	"github.com/sanbiv/private-sync/internal/config"
 	"github.com/sanbiv/private-sync/internal/execx"
@@ -28,6 +30,12 @@ const EnvVar = "PRIVATE_SYNC_PASSPHRASE"
 const BWSessionEnvVar = "BW_SESSION"
 
 // Source produces a passphrase.
+//
+// Passphrase blocks (it may prompt and run subprocesses) and is meant to be
+// called before any tea.Program exists (spec §11). The sources returned by
+// FromConfig are nevertheless safe for concurrent use: the bitwarden source
+// serialises its status/unlock step so a shared Source never unlocks twice or
+// races on the cached session.
 type Source interface {
 	Name() string
 	Passphrase(ctx context.Context, p ui.Prompter) ([]byte, error)
@@ -38,6 +46,14 @@ var ErrKeyFilePerms = errors.New("insecure key file permissions")
 
 // ErrEmptyPassphrase is returned when a source yields an empty passphrase.
 var ErrEmptyPassphrase = errors.New("empty passphrase")
+
+// ErrKeyFileTooLarge is returned when the key file exceeds MaxKeyFileSize: a
+// passphrase file is a single short line, so anything bigger is a misconfigured
+// path (a database, a log, a special file) and is refused before being read.
+var ErrKeyFileTooLarge = errors.New("key file too large")
+
+// MaxKeyFileSize bounds how many bytes ReadKeyFile will read from a key file.
+const MaxKeyFileSize = 64 << 10
 
 // envPassphrase is captured once by CaptureEnv.
 var envPassphrase []byte
@@ -216,6 +232,9 @@ func openKeyFile(path string) (*os.File, error) {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil, fmt.Errorf("key file %s does not exist: %w", path, err)
 		}
+		if isSymlinkOpenError(err) {
+			return nil, fmt.Errorf("key file %s is a symlink; pass the resolved path (see ResolveKeyFile): %w", path, err)
+		}
 		return nil, fmt.Errorf("key file %s: %w", path, err)
 	}
 	fi, err := f.Stat()
@@ -234,19 +253,48 @@ func openKeyFile(path string) (*os.File, error) {
 	return f, nil
 }
 
-// CheckKeyFile verifies that path (already resolved) is a regular file with safe
-// permissions and ownership (checks skipped on Windows).
+// CheckKeyFile verifies that the key file at path is a regular file with safe
+// permissions and ownership (checks skipped on Windows) without reading it. Like
+// ReadKeyFile it accepts any user-facing path: ~ is expanded and symlinks are
+// resolved first, so the checked (and reported) path is the final target. Callers
+// such as config validation or the wizard can pass the configured path as-is.
 func CheckKeyFile(path string) error {
-	f, err := openKeyFile(path)
+	resolved, err := ResolveKeyFile(path)
+	if err != nil {
+		return err
+	}
+	f, err := openKeyFile(resolved)
 	if err != nil {
 		return err
 	}
 	return f.Close()
 }
 
-// ReadKeyFile resolves, checks and reads a key file, trimming trailing whitespace.
-// The file is opened once: the bytes returned are the ones whose permissions
-// were checked.
+// shellQuote returns path quoted for copy-pasting into a POSIX shell. Paths made
+// only of "safe" characters are returned unchanged (so the common case reads
+// exactly like OpenSSH's hint); anything else is wrapped in single quotes, with
+// embedded single quotes spelled '\”.
+func shellQuote(path string) string {
+	if path != "" && !strings.ContainsFunc(path, func(r rune) bool { return !isShellSafe(r) }) {
+		return path
+	}
+	return "'" + strings.ReplaceAll(path, "'", `'\''`) + "'"
+}
+
+// isShellSafe reports whether r never needs quoting in a POSIX shell word.
+func isShellSafe(r rune) bool {
+	switch {
+	case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		return true
+	}
+	return strings.ContainsRune("/._-+:@,%=", r)
+}
+
+// ReadKeyFile resolves, checks and reads a key file, trimming trailing whitespace
+// (every Unicode white space, so a stray \v, \f or NBSP cannot silently change the
+// passphrase). The file is opened once: the bytes returned are the ones whose
+// permissions were checked. Files larger than MaxKeyFileSize are refused with
+// ErrKeyFileTooLarge; at most MaxKeyFileSize+1 bytes are ever read into memory.
 func ReadKeyFile(path string) ([]byte, error) {
 	resolved, err := ResolveKeyFile(path)
 	if err != nil {
@@ -256,13 +304,17 @@ func ReadKeyFile(path string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	data, err := io.ReadAll(f)
+	data, err := io.ReadAll(io.LimitReader(f, MaxKeyFileSize+1))
 	_ = f.Close()
 	if err != nil {
 		Zero(data)
 		return nil, fmt.Errorf("read key file %s: %w", resolved, err)
 	}
-	pw := bytes.TrimRight(data, " \t\r\n")
+	if len(data) > MaxKeyFileSize {
+		Zero(data)
+		return nil, fmt.Errorf("key file %s is larger than %d bytes; not a passphrase file: %w", resolved, MaxKeyFileSize, ErrKeyFileTooLarge)
+	}
+	pw := bytes.TrimRightFunc(data, unicode.IsSpace)
 	if len(pw) == 0 {
 		Zero(data)
 		return nil, fmt.Errorf("key file %s is empty: %w", resolved, ErrEmptyPassphrase)
@@ -287,6 +339,8 @@ type bitwardenSource struct {
 	field  string
 
 	session string // unlock session kept in memory for this process
+
+	mu sync.Mutex // guards session: status/unlock runs at most once per source
 }
 
 func (*bitwardenSource) Name() string { return string(config.KeyBitwarden) }
@@ -364,6 +418,23 @@ func (s *bitwardenSource) unlock(ctx context.Context, p ui.Prompter) (string, er
 }
 
 func (s *bitwardenSource) Passphrase(ctx context.Context, p ui.Prompter) ([]byte, error) {
+	session, err := s.ensureSession(ctx, p)
+	if err != nil {
+		return nil, err
+	}
+	out, err := s.run(ctx, []string{BWSessionEnvVar + "=" + session}, "get", "item", s.item)
+	if err != nil {
+		return nil, fmt.Errorf("bw get item %s: %w", s.item, err)
+	}
+	return extractBWField(out, s.item, s.field)
+}
+
+// ensureSession returns the cached session key, establishing it on first use via
+// `bw status` and, when needed, `bw unlock`. The whole status/unlock step runs
+// under s.mu so concurrent callers sharing one source prompt and unlock once.
+func (s *bitwardenSource) ensureSession(ctx context.Context, p ui.Prompter) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.session == "" {
 		// A session the user exported is handed to `bw status` (and only to it, for
 		// this one command) so the CLI can actually report "unlocked"; without it
@@ -375,40 +446,36 @@ func (s *bitwardenSource) Passphrase(ctx context.Context, p ui.Prompter) ([]byte
 		}
 		st, err := s.status(ctx, statusEnv)
 		if err != nil {
-			return nil, err
+			return "", err
 		}
 		switch st {
 		case "unauthenticated":
-			return nil, errors.New("bitwarden: not logged in; run `bw login` first")
+			return "", errors.New("bitwarden: not logged in; run `bw login` first")
 		case "unlocked":
 			// "unlocked" without an exported session (e.g. a stale status from a
 			// different environment) is treated like "locked" below.
 			s.session = envSession
 		case "locked":
 		default:
-			return nil, fmt.Errorf("bw status: unexpected status %q", st)
+			return "", fmt.Errorf("bw status: unexpected status %q", st)
 		}
 		if s.session == "" {
 			session, err := s.unlock(ctx, p)
 			if err != nil {
-				return nil, err
+				return "", err
 			}
 			s.session = session
 		}
 	}
-
-	out, err := s.run(ctx, []string{BWSessionEnvVar + "=" + s.session}, "get", "item", s.item)
-	if err != nil {
-		return nil, fmt.Errorf("bw get item %s: %w", s.item, err)
-	}
-	return extractBWField(out, s.item, s.field)
+	return s.session, nil
 }
 
 // extractBWField parses `bw get item` JSON output and returns the requested field:
 // "password" → login.password, "notes" → notes, anything else → the custom field
-// with that name. Whichever field is chosen, trailing whitespace and newlines are
-// trimmed, exactly as the file source trims a key file, so a value pasted with a
-// trailing newline unlocks the vault regardless of where it was stored.
+// with that name. Whichever field is chosen, trailing white space (any Unicode
+// space, including \v, \f and NBSP) is trimmed exactly as the file source trims a
+// key file, so a value pasted with a trailing newline unlocks the vault regardless
+// of where it was stored.
 func extractBWField(out []byte, item, field string) ([]byte, error) {
 	var it bwItem
 	if err := json.Unmarshal(bytes.TrimSpace(out), &it); err != nil {
@@ -441,7 +508,7 @@ func extractBWField(out []byte, item, field string) ([]byte, error) {
 			return nil, fmt.Errorf("bitwarden item %q has no field named %q", item, field)
 		}
 	}
-	value = strings.TrimRight(value, " \t\r\n")
+	value = strings.TrimRightFunc(value, unicode.IsSpace)
 	if value == "" {
 		return nil, fmt.Errorf("bitwarden item %q field %q: %w", item, field, ErrEmptyPassphrase)
 	}

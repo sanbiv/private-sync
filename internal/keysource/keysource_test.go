@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/sanbiv/private-sync/internal/config"
@@ -78,6 +80,17 @@ func unsetBWSession(t *testing.T) {
 	t.Helper()
 	t.Setenv(BWSessionEnvVar, "")
 	if err := os.Unsetenv(BWSessionEnvVar); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// unsetEnvVar removes PRIVATE_SYNC_PASSPHRASE for the duration of the test and
+// restores the developer's exported value afterwards (t.Setenv registers the
+// restore); a bare os.Unsetenv would silently drop it for the rest of the binary.
+func unsetEnvVar(t *testing.T) {
+	t.Helper()
+	t.Setenv(EnvVar, "")
+	if err := os.Unsetenv(EnvVar); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -266,6 +279,51 @@ func TestFileSource(t *testing.T) {
 				return writeTemp(t, dir, "knl", "  se cret \t\r\n\n", 0o600)
 			},
 			want: "  se cret",
+		},
+		{
+			// Spec §11: "trimmed of trailing whitespace" means every white space
+			// character, not just space/tab/CR/LF: \v, \f, NBSP and NEL must go too.
+			name: "trailing vertical tab, form feed and NBSP trimmed",
+			setup: func(t *testing.T) string {
+				return writeTemp(t, dir, "kvt", "se cret\n\v\f\u00a0\u0085 \t", 0o600)
+			},
+			want: "se cret",
+		},
+		{
+			name: "interior unicode whitespace kept, only the tail trimmed",
+			setup: func(t *testing.T) string {
+				return writeTemp(t, dir, "kmid", "se\u00a0cret\v\f", 0o600)
+			},
+			want: "se\u00a0cret",
+		},
+		{
+			name:    "vertical tab and form feed only is empty",
+			setup:   func(t *testing.T) string { return writeTemp(t, dir, "kvtonly", "\v\f\u00a0", 0o600) },
+			wantErr: ErrEmptyPassphrase,
+		},
+		{
+			name: "exactly MaxKeyFileSize bytes accepted",
+			setup: func(t *testing.T) string {
+				return writeTemp(t, dir, "kmax", strings.Repeat("a", MaxKeyFileSize), 0o600)
+			},
+			want: strings.Repeat("a", MaxKeyFileSize),
+		},
+		{
+			name: "larger than MaxKeyFileSize rejected",
+			setup: func(t *testing.T) string {
+				return writeTemp(t, dir, "kbig", strings.Repeat("a", 70<<10)+"\n", 0o600)
+			},
+			wantErr: ErrKeyFileTooLarge,
+			errText: "is larger than 65536 bytes; not a passphrase file",
+		},
+		{
+			// One byte over the limit, even when the excess is whitespace: the
+			// limit is on the file, not on the trimmed passphrase.
+			name: "MaxKeyFileSize plus one trailing newline rejected",
+			setup: func(t *testing.T) string {
+				return writeTemp(t, dir, "kmax1", strings.Repeat("a", MaxKeyFileSize)+"\n", 0o600)
+			},
+			wantErr: ErrKeyFileTooLarge,
 		},
 		{
 			name:    "whitespace only is empty",
@@ -563,7 +621,7 @@ func TestCaptureEnvAndObtain(t *testing.T) {
 
 	t.Run("unset env uses configured source", func(t *testing.T) {
 		envPassphrase = nil
-		os.Unsetenv(EnvVar)
+		unsetEnvVar(t)
 		CaptureEnv()
 		if envPassphrase != nil {
 			t.Fatal("envPassphrase captured from nothing")
@@ -583,6 +641,82 @@ func TestCaptureEnvAndObtain(t *testing.T) {
 	})
 }
 
+// TestCaptureEnvTestHygiene is the regression test for the test suite itself: a
+// developer who has PRIVATE_SYNC_PASSPHRASE exported must find it untouched after
+// the CaptureEnv tests ran (CaptureEnv unsets it, and the tests clear it), so the
+// helpers must register a restore rather than call os.Unsetenv directly.
+func TestCaptureEnvTestHygiene(t *testing.T) {
+	t.Cleanup(func() { envPassphrase = nil })
+	t.Setenv(EnvVar, "developer-value")
+	t.Setenv(BWSessionEnvVar, "developer-session")
+
+	t.Run("inner test clears both variables", func(t *testing.T) {
+		envPassphrase = nil
+		unsetEnvVar(t)
+		unsetBWSession(t)
+		if _, ok := os.LookupEnv(EnvVar); ok {
+			t.Fatalf("%s still set inside the inner test", EnvVar)
+		}
+		if _, ok := os.LookupEnv(BWSessionEnvVar); ok {
+			t.Fatalf("%s still set inside the inner test", BWSessionEnvVar)
+		}
+		CaptureEnv()
+		if envPassphrase != nil {
+			t.Fatal("envPassphrase captured from nothing")
+		}
+	})
+	t.Run("inner test captures and unsets", func(t *testing.T) {
+		envPassphrase = nil
+		t.Setenv(EnvVar, "inner")
+		CaptureEnv()
+		if string(envPassphrase) != "inner" {
+			t.Fatalf("captured %q", envPassphrase)
+		}
+		if _, ok := os.LookupEnv(EnvVar); ok {
+			t.Fatalf("%s still set after CaptureEnv", EnvVar)
+		}
+	})
+
+	if got := os.Getenv(EnvVar); got != "developer-value" {
+		t.Fatalf("%s = %q after inner tests, want the developer's value restored", EnvVar, got)
+	}
+	if got := os.Getenv(BWSessionEnvVar); got != "developer-session" {
+		t.Fatalf("%s = %q after inner tests, want the developer's value restored", BWSessionEnvVar, got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// shellQuote
+// ---------------------------------------------------------------------------
+
+func TestShellQuote(t *testing.T) {
+	tests := []struct {
+		in, want string
+	}{
+		{"", "''"},
+		{"/home/me/.config/private-sync/key", "/home/me/.config/private-sync/key"},
+		{"C:/Users/me/key", "C:/Users/me/key"},
+		{"/tmp/a-b_c.d+e:f@g,h%i=j", "/tmp/a-b_c.d+e:f@g,h%i=j"},
+		{"/Users/me/My Keys/key", "'/Users/me/My Keys/key'"},
+		{"/tmp/it's/key", `'/tmp/it'\''s/key'`},
+		{"/tmp/$HOME/key", "'/tmp/$HOME/key'"},
+		{"/tmp/a;rm -rf /", "'/tmp/a;rm -rf /'"},
+		{"/tmp/a\tb", "'/tmp/a\tb'"},
+		{"/tmp/a\nb", "'/tmp/a\nb'"},
+		{"/tmp/key*", "'/tmp/key*'"},
+		{"/tmp/key(1)", "'/tmp/key(1)'"},
+		{"/tmp/\u00e9/key", "'/tmp/\u00e9/key'"},
+		{"~/key", "'~/key'"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.in, func(t *testing.T) {
+			if got := shellQuote(tc.in); got != tc.want {
+				t.Fatalf("shellQuote(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
 // ---------------------------------------------------------------------------
 // bitwarden source
 // ---------------------------------------------------------------------------
@@ -594,7 +728,8 @@ const bwItemJSON = `{
   "fields": [
     {"name": "empty", "value": "", "type": 1},
     {"name": "custom", "value": "custom-pass", "type": 1},
-    {"name": "trailing", "value": "trail-pass \t\r\n\n", "type": 1},
+    {"name": "trailing", "value": "trail-pass \t\r\n\n\u000b\u000c\u00a0", "type": 1},
+    {"name": "vtonly", "value": "\u000b\u000c\u00a0", "type": 1},
     {"name": "nullval", "value": null, "type": 1}
   ]
 }`
@@ -739,6 +874,9 @@ func TestBitwardenFieldSelection(t *testing.T) {
 		{name: "notes trimmed", field: "notes", item: bwItemJSON, want: "note-pass"},
 		{name: "custom field", field: "custom", item: bwItemJSON, want: "custom-pass"},
 		{name: "custom field trailing whitespace trimmed", field: "trailing", item: bwItemJSON, want: "trail-pass"},
+		{name: "custom field vertical tab, form feed and NBSP only is empty", field: "vtonly", item: bwItemJSON, errText: "empty passphrase"},
+		{name: "notes trailing vertical tab and form feed trimmed", field: "notes", item: `{"notes":"note\u00a0pass\n\u000b\u000c"}`, want: "note\u00a0pass"},
+		{name: "password trailing vertical tab and form feed trimmed", field: "password", item: `{"login":{"password":"pw\u000b\u000c\u00a0\u0085"}}`, want: "pw"},
 		{name: "custom field whitespace only is empty", field: "ws", item: `{"fields":[{"name":"ws","value":" \n"}]}`, errText: "empty passphrase"},
 		{name: "password trailing whitespace trimmed", field: "password", item: `{"login":{"password":"  pw one \t\r\n"}}`, want: "  pw one"},
 		{name: "password whitespace only is empty", field: "password", item: `{"login":{"password":"\n"}}`, errText: "empty passphrase"},
@@ -1098,5 +1236,164 @@ func TestZero(t *testing.T) {
 	Zero(b)
 	if string(b) != "\x00\x00\x00" {
 		t.Fatalf("Zero = %q", b)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// concurrency
+// ---------------------------------------------------------------------------
+
+// syncBWFake is a goroutine-safe bw fake: `bw status` reports locked, unlock
+// hands out one session, and every command is counted. It deliberately delays
+// the unlock so concurrent callers pile up on the same source.
+type syncBWFake struct {
+	mu      sync.Mutex
+	cmds    []recordedCmd
+	unlocks atomic.Int32
+	gets    atomic.Int32
+	status  atomic.Int32
+}
+
+func (b *syncBWFake) runner(t *testing.T) execx.Runner {
+	return execx.Fake(func(c execx.Cmd) (execx.Result, error) {
+		rc := record(c)
+		b.mu.Lock()
+		b.cmds = append(b.cmds, rc)
+		b.mu.Unlock()
+		switch {
+		case rc.is("status"):
+			b.status.Add(1)
+			return execx.Result{Stdout: []byte(`{"status":"locked"}`)}, nil
+		case rc.is("unlock"):
+			b.unlocks.Add(1)
+			runtime.Gosched()
+			return execx.Result{Stdout: []byte("sess-shared\n")}, nil
+		case rc.is("get", "item"):
+			b.gets.Add(1)
+			return execx.Result{Stdout: []byte(bwItemJSON)}, nil
+		default:
+			t.Errorf("unexpected bw command %v", rc.Args)
+			return execx.Result{ExitCode: 1}, nil
+		}
+	})
+}
+
+// countingPrompter is a goroutine-safe prompter that always answers "master".
+type countingPrompter struct {
+	calls atomic.Int32
+}
+
+func (c *countingPrompter) Password(_ context.Context, _ string) ([]byte, error) {
+	c.calls.Add(1)
+	runtime.Gosched()
+	return []byte("master"), nil
+}
+
+func (*countingPrompter) Confirm(_ context.Context, _ string, def bool) (bool, error) {
+	return def, nil
+}
+
+// TestBitwardenConcurrentPassphrase pins the session guard: N goroutines sharing
+// one locked bitwarden source prompt and unlock exactly once, every call gets the
+// passphrase, and the race detector (go test -race) sees no unsynchronised write
+// to the cached session.
+func TestBitwardenConcurrentPassphrase(t *testing.T) {
+	unsetBWSession(t)
+	fake := &syncBWFake{}
+	src, err := FromConfig(bwCfg("vault", "custom"), fake.runner(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &countingPrompter{}
+
+	const n = 16
+	var wg sync.WaitGroup
+	results := make([]string, n)
+	errs := make([]error, n)
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			got, err := src.Passphrase(context.Background(), p)
+			results[i], errs[i] = string(got), err
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for i := 0; i < n; i++ {
+		if errs[i] != nil {
+			t.Fatalf("call %d: %v", i, errs[i])
+		}
+		if results[i] != "custom-pass" {
+			t.Fatalf("call %d: got %q", i, results[i])
+		}
+	}
+	if got := fake.status.Load(); got != 1 {
+		t.Errorf("status calls = %d, want 1", got)
+	}
+	if got := fake.unlocks.Load(); got != 1 {
+		t.Errorf("unlock calls = %d, want 1", got)
+	}
+	if got := p.calls.Load(); got != 1 {
+		t.Errorf("prompted %d times, want 1", got)
+	}
+	if got := fake.gets.Load(); got != n {
+		t.Errorf("get item calls = %d, want %d", got, n)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	assertEnvIsolation(t, fake.cmds, "master", "sess-shared", "")
+}
+
+// TestBitwardenConcurrentUnlockFailureDoesNotCacheSession: a failed unlock must
+// leave the source unlocked-less so a later call retries instead of reusing junk.
+func TestBitwardenUnlockFailureNotCached(t *testing.T) {
+	unsetBWSession(t)
+	fake := &bwFake{status: "locked", session: "", item: bwItemJSON}
+	src, err := FromConfig(bwCfg("vault", "custom"), fake.runner(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &fakePrompter{answers: [][]byte{[]byte("master"), []byte("master")}}
+	if _, err := src.Passphrase(context.Background(), p); err == nil || !strings.Contains(err.Error(), "empty session key") {
+		t.Fatalf("err = %v, want empty session key", err)
+	}
+	fake.session = "sess-2"
+	got, err := src.Passphrase(context.Background(), p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "custom-pass" {
+		t.Fatalf("got %q", got)
+	}
+	if n := len(fake.find("unlock")); n != 2 {
+		t.Fatalf("unlock calls = %d, want 2 (retry after failure)", n)
+	}
+	if len(fake.find("get", "item")) != 1 {
+		t.Fatalf("get item calls = %v", fake.find("get", "item"))
+	}
+}
+
+// TestReadKeyFileLimitDoesNotOverRead: the oversized check is enforced by a
+// limiter, so at most MaxKeyFileSize+1 bytes are ever pulled into memory. We can
+// only observe this indirectly: a file just over the limit fails identically to a
+// far larger one, with the same wrapped sentinel and no partial passphrase.
+func TestReadKeyFileLimitDoesNotOverRead(t *testing.T) {
+	dir := t.TempDir()
+	for _, size := range []int{MaxKeyFileSize + 1, MaxKeyFileSize + 4096, 1 << 20} {
+		p := writeTemp(t, dir, fmt.Sprintf("k%d", size), strings.Repeat("z", size), 0o600)
+		got, err := ReadKeyFile(p)
+		if !errors.Is(err, ErrKeyFileTooLarge) {
+			t.Fatalf("size %d: err = %v, want ErrKeyFileTooLarge", size, err)
+		}
+		if got != nil {
+			t.Fatalf("size %d: returned %d bytes with error", size, len(got))
+		}
+		if !strings.Contains(err.Error(), p) {
+			t.Fatalf("size %d: err %q should name the resolved path", size, err)
+		}
 	}
 }

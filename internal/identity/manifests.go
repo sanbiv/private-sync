@@ -60,7 +60,9 @@ func readManifest(dir, name string) string {
 	if err != nil {
 		return ""
 	}
-	return string(data)
+	// Windows editors commonly prefix files with a UTF-8 BOM, which would
+	// otherwise defeat every prefix/JSON/XML parser below.
+	return strings.TrimPrefix(string(data), "\uFEFF")
 }
 
 // ---- go.mod -----------------------------------------------------------------

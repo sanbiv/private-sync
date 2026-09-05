@@ -1,6 +1,8 @@
 package remote
 
 import (
+	"errors"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -47,6 +49,37 @@ func pathExists(dir, rel string) bool {
 	return err == nil
 }
 
+// lastEnv returns the value of the last KEY= entry in env (os/exec semantics:
+// a later duplicate wins) and whether the key is present at all.
+func lastEnv(env []string, key string) (string, bool) {
+	val, found := "", false
+	for _, kv := range env {
+		if k, v, ok := strings.Cut(kv, "="); ok && k == key {
+			val, found = v, true
+		}
+	}
+	return val, found
+}
+
+// countFiles counts the regular files below root (0 when root is missing).
+func countFiles(t *testing.T, root string) int {
+	t.Helper()
+	n := 0
+	err := filepath.WalkDir(root, func(_ string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.Type().IsRegular() {
+			n++
+		}
+		return nil
+	})
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		t.Fatal(err)
+	}
+	return n
+}
+
 // expectedGitPrefix is the -c prefix every git invocation must carry.
 func expectedGitPrefix() []string {
 	null := os.DevNull
@@ -59,6 +92,7 @@ func expectedGitPrefix() []string {
 		"-c", "commit.gpgsign=false",
 		"-c", "core.autocrlf=false",
 		"-c", "core.hooksPath=" + null,
+		"-c", "core.askPass=",
 	}
 }
 
@@ -146,8 +180,18 @@ func out(stdout string) execx.Result { return execx.Result{Stdout: []byte(stdout
 
 // --- real git helpers -------------------------------------------------------
 
+// inheritedGitVars are the environment variables a hook or an outer git
+// command exports for *its* repository, plus the askpass helpers an IDE
+// terminal exports; the backend must be immune to all of them.
+var inheritedGitVars = []string{
+	"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE",
+	"GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR",
+	"GIT_ASKPASS", "SSH_ASKPASS",
+}
+
 // requireGit skips the test without a git binary and isolates git from the
-// user's global/system configuration and home directory.
+// user's global/system configuration, home directory and inherited
+// repository variables (tests that exercise immunity set them explicitly).
 func requireGit(t *testing.T) {
 	t.Helper()
 	if _, ok := execx.LookPath("git"); !ok {
@@ -157,7 +201,7 @@ func requireGit(t *testing.T) {
 	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
 	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
 	t.Setenv("GIT_SSH_COMMAND", "")
-	for _, k := range []string{"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY"} {
+	for _, k := range inheritedGitVars {
 		if v, ok := os.LookupEnv(k); ok {
 			// An empty value still counts as set for git; restore afterwards.
 			t.Cleanup(func() { _ = os.Setenv(k, v) })
@@ -166,13 +210,28 @@ func requireGit(t *testing.T) {
 	}
 }
 
+// cleanGitEnv returns os.Environ() without the inherited repository and
+// askpass variables (a test may set them to simulate a hook or IDE
+// environment), so helper git invocations always operate on their Dir.
+func cleanGitEnv() []string {
+	var env []string
+	for _, kv := range os.Environ() {
+		k, _, _ := strings.Cut(kv, "=")
+		if slices.Contains(inheritedGitVars, k) {
+			continue
+		}
+		env = append(env, kv)
+	}
+	return append(env, "GIT_TERMINAL_PROMPT=0", "LC_ALL=C")
+}
+
 // rawGit runs git directly (outside the backend) for setup and assertions.
 func rawGit(t *testing.T, dir string, args ...string) string {
 	t.Helper()
 	full := append([]string{"-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=" + os.DevNull}, args...)
 	cmd := exec.Command("git", full...)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "LC_ALL=C")
+	cmd.Env = cleanGitEnv()
 	outb, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, outb)

@@ -18,7 +18,7 @@ import (
 func rawGitErr(dir string, args ...string) error {
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "LC_ALL=C")
+	cmd.Env = cleanGitEnv()
 	return cmd.Run()
 }
 

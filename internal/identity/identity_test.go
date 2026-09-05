@@ -57,6 +57,18 @@ func TestNormalizeGitURL(t *testing.T) {
 		{"leading slash scp", "git@github.com:/foo/bar.git", "github.com/foo/bar", true},
 		{"ipv6 bracket with port", "ssh://git@[::1]:2222/foo/bar.git", "[::1]/foo/bar", true},
 
+		// scp form edge cases: '@' in the path (with and without a slash) and
+		// bracketed IPv6 hosts.
+		{"scp at sign in path no slash", "git@github.com:foo@bar", "github.com/foo@bar", true},
+		{"scp at sign and colon in path", "git@github.com:foo/x@y:z", "github.com/foo/x@y:z", true},
+		{"scp at sign in path no user", "host:path@x", "host/path@x", true},
+		{"scp password with at sign", "user:pa@ss@host:path/repo", "host/path/repo", true},
+		{"ipv6 scp", "[::1]:foo/bar", "[::1]/foo/bar", true},
+		{"ipv6 scp with user", "git@[::1]:foo/bar.git", "[::1]/foo/bar", true},
+		{"ipv6 scp full address", "git@[2001:db8::1]:foo/bar", "[2001:db8::1]/foo/bar", true},
+		{"ipv6 scp unterminated bracket", "[::1:foo/bar", "", false},
+		{"ipv6 scp empty bracket", "[]:foo/bar", "", false},
+
 		{"empty", "", "", false},
 		{"whitespace", "   ", "", false},
 		{"file scheme", "file:///home/me/repo.git", "", false},
@@ -618,6 +630,17 @@ func TestDetect_Manifests(t *testing.T) {
 		{"pubspec.yaml invalid", map[string]string{"pubspec.yaml": "name: [unclosed\n"}, nil},
 		{"pubspec.yaml no name", map[string]string{"pubspec.yaml": "description: x\n"}, nil},
 		{"empty files", map[string]string{"go.mod": "", "package.json": "", "Cargo.toml": "", "pom.xml": "", "pubspec.yaml": ""}, nil},
+		// A UTF-8 BOM (Windows editors) must not disable detection.
+		{"bom go.mod", map[string]string{"go.mod": "\uFEFFmodule example.com/bom\n"}, []string{"go:example.com/bom"}},
+		{"bom package.json", map[string]string{"package.json": "\uFEFF{\"name\": \"Bom-Pkg\"}"}, []string{"npm:bom-pkg"}},
+		{"bom Cargo.toml", map[string]string{"Cargo.toml": "\uFEFF[package]\nname = \"bomcrate\"\n"}, []string{"cargo:bomcrate"}},
+		{"bom pyproject", map[string]string{"pyproject.toml": "\uFEFF[project]\nname = \"BomPy\"\n"}, []string{"py:bompy"}},
+		{"bom composer.json", map[string]string{"composer.json": "\uFEFF{\"name\": \"V/Bom\"}"}, []string{"composer:v/bom"}},
+		{"bom pom.xml", map[string]string{"pom.xml": "\uFEFF<project><groupId>g</groupId><artifactId>bom</artifactId></project>"}, []string{"maven:g:bom"}},
+		{"bom gemspec", map[string]string{"x.gemspec": "\uFEFFs.name = 'bomgem'"}, []string{"gem:bomgem"}},
+		{"bom Package.swift", map[string]string{"Package.swift": "\uFEFFPackage(name: \"BomSwift\")"}, []string{"swift:BomSwift"}},
+		{"bom pubspec.yaml", map[string]string{"pubspec.yaml": "\uFEFFname: bom_dart\n"}, []string{"dart:bom_dart"}},
+		{"bom only file", map[string]string{"go.mod": "\uFEFF", "package.json": "\uFEFF"}, nil},
 		{"all kinds in order", map[string]string{
 			"go.mod":         "module m\n",
 			"package.json":   `{"name":"n"}`,
@@ -743,14 +766,7 @@ func TestDetect_FullOrder(t *testing.T) {
 
 func TestDetect_RelativeDir(t *testing.T) {
 	dir := t.TempDir()
-	wd, err := os.Getwd()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chdir(dir); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chdir(wd) })
+	t.Chdir(dir)
 	got, err := Detect(context.Background(), ".", failingRunner(nil))
 	if err != nil {
 		t.Fatal(err)
@@ -805,10 +821,26 @@ func TestDetect_RealGit(t *testing.T) {
 		t.Skip("git not installed")
 	}
 	root := t.TempDir()
+	// Isolate both the setup commands and the Detect call under test (which
+	// runs execx.Real() with the inherited environment) from the developer's
+	// global/system git config and from any GIT_* overrides in effect, e.g.
+	// when tests run from a git hook.
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	t.Setenv("GIT_CONFIG_SYSTEM", os.DevNull)
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	t.Setenv("HOME", root)
+	t.Setenv("XDG_CONFIG_HOME", root)
+	for _, k := range []string{"GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_CEILING_DIRECTORIES", "GIT_DISCOVERY_ACROSS_FILESYSTEM"} {
+		// t.Setenv registers the restore; the variable must then be absent
+		// (an empty GIT_DIR is not the same as an unset one).
+		t.Setenv(k, "")
+		if err := os.Unsetenv(k); err != nil {
+			t.Fatal(err)
+		}
+	}
 	run := func(args ...string) {
 		t.Helper()
 		cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
-		cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null", "HOME="+root)
 		if out, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("git %v: %v\n%s", args, err, out)
 		}
@@ -958,6 +990,11 @@ func TestMatchProjects_LevelClassification(t *testing.T) {
 			if len(got) != 1 || got[0].Strength != tt.want || len(got[0].Shared) != tt.wantSize {
 				t.Fatalf("got %+v, want strength %d with %d shared", got, tt.want, tt.wantSize)
 			}
+			// Strongest and MatchProjects must classify levels identically: a
+			// strong match always has a strongest fingerprint, a weak one never.
+			if _, ok := Strongest(tt.local); ok != (tt.want == StrengthStrong) {
+				t.Fatalf("Strongest ok=%v disagrees with match strength %d", ok, tt.want)
+			}
 		})
 	}
 }
@@ -975,6 +1012,13 @@ func TestStrongest(t *testing.T) {
 		{"strong beats earlier package", []Fingerprint{fp("go", "m", LevelPackage), fp("git", "a", LevelStrong)}, "git:a", true},
 		{"first package", []Fingerprint{fp("dir", "x", LevelDir), fp("npm", "n", LevelPackage), fp("go", "m", LevelPackage)}, "npm:n", true},
 		{"unknown level ignored", []Fingerprint{fp("odd", "x", 7)}, "", false},
+		// Zero (legacy/hand-built) levels are classified by kind, exactly as
+		// MatchProjects does, so a strong match always has a strongest fingerprint.
+		{"zero level git kind", []Fingerprint{fp("git", "a", 0)}, "git:a", true},
+		{"zero level package kind", []Fingerprint{fp("dir", "x", 0), fp("npm", "n", 0)}, "npm:n", true},
+		{"zero level git beats explicit package", []Fingerprint{fp("go", "m", LevelPackage), fp("git", "a", 0)}, "git:a", true},
+		{"zero level dir kind only", []Fingerprint{fp("dir", "x", 0)}, "", false},
+		{"zero level unknown kind", []Fingerprint{fp("odd", "x", 0)}, "", false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 
 	"golang.org/x/crypto/argon2"
 	"golang.org/x/crypto/chacha20poly1305"
@@ -59,6 +60,9 @@ const (
 
 	// BlobAADPrefix is prepended to the blob id to form the blob AAD.
 	BlobAADPrefix = "blob:"
+	// VaultKeyAADPrefix is prepended to the vault id to form the AAD of the
+	// wrapped vault key stored in vault.json (spec §4: "vault-key:" + vaultID).
+	VaultKeyAADPrefix = "vault-key:"
 	// ProjectIDPrefix is the KeyedID label for project ids (§4/§7).
 	ProjectIDPrefix = "project:"
 	// ProjectIDLen is the number of hex characters kept from the project id digest.
@@ -74,8 +78,9 @@ var (
 	ErrKDFParams = errors.New("invalid KDF parameters")
 	// ErrKeySize is returned when a key has the wrong length.
 	ErrKeySize = errors.New("key must be exactly 32 bytes")
-	// ErrAAD is returned when a document AAD is not in canonical (slash-separated) form.
-	ErrAAD = errors.New("document aad must be a slash-separated vault-relative path")
+	// ErrAAD is returned when a document AAD is empty or not in canonical
+	// (slash-separated) form.
+	ErrAAD = errors.New("document aad must be a non-empty slash-separated vault-relative path")
 )
 
 // KDFParams are the Argon2id parameters stored in vault.json.
@@ -125,15 +130,18 @@ func (p KDFParams) Validate() error {
 // DeriveKEK runs Argon2id and returns the 32-byte key-encryption key.
 //
 // The passphrase buffer is zeroed right after Argon2id has consumed it
-// (spec §4), whether or not the derivation succeeds; callers that need the
-// passphrase again (e.g. to derive under fresh parameters) must pass a copy.
-// The returned KEK is the caller's to Zero once the vault key is unwrapped.
+// (spec §4), so a caller that needs it again (e.g. to derive under fresh
+// parameters) must pass a copy. When p fails Validate the KDF never runs
+// and the passphrase is left untouched, so the caller can retry with
+// corrected parameters (or wipe it itself). The returned KEK is the
+// caller's to Zero once the vault key is unwrapped.
 func DeriveKEK(passphrase []byte, p KDFParams) ([]byte, error) {
-	defer Zero(passphrase)
 	if err := p.Validate(); err != nil {
 		return nil, fmt.Errorf("crypto.DeriveKEK: %w", err)
 	}
-	return argon2.IDKey(passphrase, p.Salt, p.Time, p.Memory, p.Threads, KeySize), nil
+	kek := argon2.IDKey(passphrase, p.Salt, p.Time, p.Memory, p.Threads, KeySize)
+	Zero(passphrase)
+	return kek, nil
 }
 
 // NewVaultKey returns 32 random bytes.
@@ -171,8 +179,16 @@ func UnwrapKey(kek, wrapped []byte, aad string) ([]byte, error) {
 }
 
 // Keys holds the three HKDF subkeys derived from the vault key.
+//
+// All methods are safe for concurrent use: readers (BlobID, Seal*, Open*,
+// KeyedID, ProjectID) share a read lock and Zero takes the write lock, so
+// a Zero racing with an in-flight operation either waits for it to finish
+// or makes the next operation fail with the not-ready error — never a
+// half-wiped key feeding the AEAD.
 type Keys struct {
 	enc, mac, nonce []byte
+
+	mu sync.RWMutex // guards enc, mac, nonce
 }
 
 // NewKeys derives the enc/mac/nonce subkeys from vk.
@@ -208,36 +224,61 @@ func deriveSubkey(vk []byte, label string) ([]byte, error) {
 
 // Zero wipes the subkeys and releases them, so every later method on k
 // fails (errKeysNotReady) or returns an empty id instead of silently
-// operating with all-zero keys. Safe on nil and idempotent.
+// operating with all-zero keys. Safe on nil, idempotent, and safe to call
+// while other goroutines are using k (it waits for in-flight operations).
 func (k *Keys) Zero() {
 	if k == nil {
 		return
 	}
+	k.mu.Lock()
+	defer k.mu.Unlock()
 	Zero(k.enc)
 	Zero(k.mac)
 	Zero(k.nonce)
 	k.enc, k.mac, k.nonce = nil, nil, nil
 }
 
+// rlock takes the read lock and reports whether the subkeys are present and
+// of the right size. The caller must release the lock (via the returned
+// func) whatever the result; on a nil receiver there is no lock to take and
+// the release is a no-op.
+func (k *Keys) rlock() (ready bool, release func()) {
+	if k == nil {
+		return false, func() {}
+	}
+	k.mu.RLock()
+	return k.ready(), k.mu.RUnlock
+}
+
 // ready reports whether the subkeys are present and of the right size.
+// Callers must hold k.mu (read or write).
 func (k *Keys) ready() bool {
 	return k != nil && len(k.enc) == KeySize && len(k.mac) == KeySize && len(k.nonce) == KeySize
 }
 
 // BlobID returns hex(HMAC-SHA256(mac, plaintext)).
 func (k *Keys) BlobID(plaintext []byte) string {
-	if !k.ready() {
+	ready, release := k.rlock()
+	defer release()
+	if !ready {
 		return ""
 	}
+	return k.blobID(plaintext)
+}
+
+// blobID is BlobID without locking; the caller holds k.mu and has checked ready().
+func (k *Keys) blobID(plaintext []byte) string {
 	return hex.EncodeToString(hmacSHA256(k.mac, plaintext))
 }
 
 // SealBlob encrypts plaintext deterministically; returns the blob id and ciphertext.
 func (k *Keys) SealBlob(plaintext []byte) (id string, ciphertext []byte, err error) {
-	if !k.ready() {
+	ready, release := k.rlock()
+	defer release()
+	if !ready {
 		return "", nil, fmt.Errorf("crypto.SealBlob: %w", errKeysNotReady)
 	}
-	id = k.BlobID(plaintext)
+	id = k.blobID(plaintext)
 	nonce := hmacSHA256(k.nonce, plaintext)[:NonceSize]
 	ciphertext, err = seal(k.enc, nonce, BlobAADPrefix+id, plaintext)
 	if err != nil {
@@ -248,7 +289,9 @@ func (k *Keys) SealBlob(plaintext []byte) (id string, ciphertext []byte, err err
 
 // OpenBlob decrypts a blob given its id (used as AAD).
 func (k *Keys) OpenBlob(id string, ciphertext []byte) ([]byte, error) {
-	if !k.ready() {
+	ready, release := k.rlock()
+	defer release()
+	if !ready {
 		return nil, fmt.Errorf("crypto.OpenBlob: %w", errKeysNotReady)
 	}
 	pt, err := open(k.enc, BlobAADPrefix+id, ciphertext)
@@ -264,9 +307,11 @@ func (k *Keys) OpenBlob(id string, ciphertext []byte) ([]byte, error) {
 // canonical slash-separated form (build it with path.Join or
 // filepath.ToSlash, never filepath.Join, so a document sealed on Windows
 // opens on macOS/Linux and vice versa), or "trash:" + id for trash blobs.
-// An aad containing a backslash is rejected with ErrAAD.
+// An empty aad or one containing a backslash is rejected with ErrAAD.
 func (k *Keys) SealDoc(aad string, plaintext []byte) ([]byte, error) {
-	if !k.ready() {
+	ready, release := k.rlock()
+	defer release()
+	if !ready {
 		return nil, fmt.Errorf("crypto.SealDoc: %w", errKeysNotReady)
 	}
 	if err := checkDocAAD(aad); err != nil {
@@ -280,10 +325,12 @@ func (k *Keys) SealDoc(aad string, plaintext []byte) ([]byte, error) {
 }
 
 // OpenDoc decrypts a document sealed with SealDoc under the same aad
-// (see SealDoc for the canonical form). A backslash in aad is reported
-// as ErrAAD rather than surfacing as a confusing ErrAuth.
+// (see SealDoc for the canonical form). An empty aad or a backslash in aad
+// is reported as ErrAAD rather than surfacing as a confusing ErrAuth.
 func (k *Keys) OpenDoc(aad string, ciphertext []byte) ([]byte, error) {
-	if !k.ready() {
+	ready, release := k.rlock()
+	defer release()
+	if !ready {
 		return nil, fmt.Errorf("crypto.OpenDoc: %w", errKeysNotReady)
 	}
 	if err := checkDocAAD(aad); err != nil {
@@ -296,10 +343,16 @@ func (k *Keys) OpenDoc(aad string, ciphertext []byte) ([]byte, error) {
 	return pt, nil
 }
 
-// checkDocAAD rejects non-canonical document AADs (spec §5: paths are
-// slash separated). Only backslashes are refused; everything else is the
+// checkDocAAD rejects non-canonical document AADs. Spec §4 binds every
+// document to its vault-relative path or "trash:"+id, so an empty AAD would
+// silently drop the move-protection binding (a caller passing an unset path
+// would still produce a valid-looking PSV1 file); spec §5 requires slash
+// separated paths, so a backslash is refused too. Everything else is the
 // caller's business.
 func checkDocAAD(aad string) error {
+	if aad == "" {
+		return fmt.Errorf("%w: empty", ErrAAD)
+	}
 	if strings.ContainsRune(aad, '\\') {
 		return fmt.Errorf("%w: %q contains a backslash", ErrAAD, aad)
 	}
@@ -313,9 +366,16 @@ func checkDocAAD(aad string) error {
 // Callers truncate as the spec requires: project ids are the first
 // ProjectIDLen (16) hex characters (§4/§7) — use ProjectID for that.
 func (k *Keys) KeyedID(label string, data []byte) string {
-	if !k.ready() {
+	ready, release := k.rlock()
+	defer release()
+	if !ready {
 		return ""
 	}
+	return k.keyedID(label, data)
+}
+
+// keyedID is KeyedID without locking; the caller holds k.mu and has checked ready().
+func (k *Keys) keyedID(label string, data []byte) string {
 	m := hmac.New(sha256.New, k.mac)
 	m.Write([]byte(label))
 	m.Write(data)
@@ -327,7 +387,12 @@ func (k *Keys) KeyedID(label string, data []byte) string {
 // hex(HMAC-SHA256(mac, "project:" + fingerprint))[:16], as spec §4/§7 define.
 // Returns "" when the keys are not ready.
 func (k *Keys) ProjectID(fingerprint string) string {
-	id := k.KeyedID(ProjectIDPrefix, []byte(fingerprint))
+	ready, release := k.rlock()
+	defer release()
+	if !ready {
+		return ""
+	}
+	id := k.keyedID(ProjectIDPrefix, []byte(fingerprint))
 	if len(id) < ProjectIDLen {
 		return ""
 	}

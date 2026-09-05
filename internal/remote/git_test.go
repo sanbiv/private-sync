@@ -1,13 +1,18 @@
 package remote
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/sanbiv/private-sync/internal/execx"
 )
 
 const (
@@ -482,5 +487,192 @@ func TestGitContextCancelled(t *testing.T) {
 	r, _ := newGitVault(t, newBare(t), "m1")
 	if err := r.Prepare(ctx, testLog(t)); err == nil {
 		t.Fatal("Prepare with cancelled context succeeded")
+	}
+}
+
+func TestGitIgnoresInheritedRepositoryEnv(t *testing.T) {
+	requireGit(t)
+	ctx := context.Background()
+	// A hook or an outer git command exports these for the repository it is
+	// working on; they must never redirect the vault's git commands there.
+	project := filepath.Join(t.TempDir(), "project")
+	if err := os.MkdirAll(project, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	rawGit(t, project, "init", "-q", "-b", "main")
+	mustWrite(t, project, "README", "project\n")
+	rawGit(t, project, "add", "-A")
+	rawGit(t, project, "commit", "-q", "-m", "project")
+	projectHead := rawGit(t, project, "rev-parse", "HEAD")
+	projectObjects := filepath.Join(project, ".git", "objects")
+	projectObjectCount := countFiles(t, projectObjects)
+	t.Setenv("GIT_DIR", filepath.Join(project, ".git"))
+	t.Setenv("GIT_WORK_TREE", project)
+	t.Setenv("GIT_INDEX_FILE", filepath.Join(project, ".git", "index"))
+	// receive-pack's quarantine exports the object directories to hooks.
+	t.Setenv("GIT_OBJECT_DIRECTORY", projectObjects)
+	t.Setenv("GIT_ALTERNATE_OBJECT_DIRECTORIES", projectObjects)
+	t.Setenv("GIT_COMMON_DIR", filepath.Join(project, ".git"))
+
+	bare := newBare(t)
+	r, dir := newGitVault(t, bare, "m1")
+	if err := r.Prepare(ctx, testLog(t)); err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	mustWrite(t, dir, "vault.json", vaultJSONv1)
+	if err := r.Push(ctx, []string{"vault.json"}, testLog(t)); err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+	if err := r.Fetch(ctx, testLog(t)); err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if st, err := os.Stat(filepath.Join(dir, ".git")); err != nil || !st.IsDir() {
+		t.Fatalf("vault has no .git directory: %v", err)
+	}
+	if got, want := rawGit(t, bare, "rev-parse", "refs/heads/main"), rawGit(t, dir, "rev-parse", "HEAD"); got != want {
+		t.Errorf("remote main = %s, want the vault's HEAD %s", got, want)
+	}
+	if got := lsFiles(t, dir); !slices.Contains(got, "vault.json") {
+		t.Errorf("vault tracked files = %v", got)
+	}
+	if got := rawGit(t, project, "rev-parse", "HEAD"); got != projectHead {
+		t.Errorf("project HEAD moved to %s", got)
+	}
+	if got := lsFiles(t, project); !slices.Equal(got, []string{"README"}) {
+		t.Errorf("project index touched: %v", got)
+	}
+	if got := rawGit(t, project, "status", "--porcelain"); got != "" {
+		t.Errorf("project working tree touched:\n%s", got)
+	}
+	if got := countFiles(t, projectObjects); got != projectObjectCount {
+		t.Errorf("project object store gained %d files: the vault's objects were written there", got-projectObjectCount)
+	}
+	if got := countFiles(t, filepath.Join(dir, ".git", "objects")); got == 0 {
+		t.Error("vault object store is empty: objects went elsewhere")
+	}
+	if got := rawGit(t, dir, "cat-file", "-t", "HEAD"); got != "commit" {
+		t.Errorf("vault HEAD object type = %q", got)
+	}
+}
+
+func TestGitPrepareUnreadableLocalVaultJSON(t *testing.T) {
+	requireGit(t)
+	ctx := context.Background()
+	const garbage = "{not json"
+
+	t.Run("remote has history", func(t *testing.T) {
+		bare := newBare(t)
+		a, adir := newGitVault(t, bare, "m1")
+		if err := a.Prepare(ctx, testLog(t)); err != nil {
+			t.Fatal(err)
+		}
+		mustWrite(t, adir, "vault.json", vaultJSONv1)
+		if err := a.Push(ctx, []string{"vault.json"}, testLog(t)); err != nil {
+			t.Fatal(err)
+		}
+
+		b, bdir := newGitVault(t, bare, "m2")
+		mustWrite(t, bdir, "vault.json", garbage)
+		err := b.Prepare(ctx, testLog(t))
+		if err == nil {
+			t.Fatal("Prepare succeeded with an unreadable local vault.json")
+		}
+		if !strings.Contains(err.Error(), "vault.json") || !strings.Contains(err.Error(), "unreadable") {
+			t.Errorf("error does not explain the problem: %v", err)
+		}
+		if errors.Is(err, ErrVaultConflict) {
+			t.Errorf("unreadable file reported as an id conflict: %v", err)
+		}
+		if got := mustRead(t, bdir, "vault.json"); got != garbage {
+			t.Errorf("local vault.json was replaced: %q", got)
+		}
+		if rawGitErr(bdir, "rev-parse", "--verify", "-q", "HEAD") == nil {
+			t.Error("remote history adopted despite the unreadable local vault.json")
+		}
+		if got := rawGit(t, bdir, "symbolic-ref", "HEAD"); got != "refs/heads/main" {
+			t.Errorf("HEAD = %q", got)
+		}
+		// Moving the file aside (as the error suggests) lets Prepare open the remote vault.
+		if err := os.Rename(filepath.Join(bdir, "vault.json"), filepath.Join(bdir, "vault.json.bak")); err != nil {
+			t.Fatal(err)
+		}
+		if err := b.Prepare(ctx, testLog(t)); err != nil {
+			t.Fatalf("Prepare after moving the file aside: %v", err)
+		}
+		if got := mustRead(t, bdir, "vault.json"); got != vaultJSONv1 {
+			t.Errorf("vault.json = %q, want the remote copy", got)
+		}
+		if got := mustRead(t, bdir, "vault.json.bak"); got != garbage {
+			t.Errorf("moved-aside file changed: %q", got)
+		}
+	})
+
+	t.Run("remote empty", func(t *testing.T) {
+		// Nothing to compare against: the vault package reports the file.
+		b, bdir := newGitVault(t, newBare(t), "m2")
+		mustWrite(t, bdir, "vault.json", garbage)
+		if err := b.Prepare(ctx, testLog(t)); err != nil {
+			t.Fatalf("Prepare against an empty remote: %v", err)
+		}
+		if got := mustRead(t, bdir, "vault.json"); got != garbage {
+			t.Errorf("local vault.json changed: %q", got)
+		}
+	})
+}
+
+func TestGitNeverRunsAskpass(t *testing.T) {
+	requireGit(t)
+	if runtime.GOOS == "windows" {
+		t.Skip("needs a shell script as askpass helper")
+	}
+	ctx := context.Background()
+	base := t.TempDir()
+	marker := filepath.Join(base, "marker")
+	askpass := filepath.Join(base, "askpass.sh")
+	if err := os.WriteFile(askpass, []byte("#!/bin/sh\ntouch '"+marker+"'\necho secret\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// What an IDE terminal exports: git would run the helper for any
+	// credential prompt before it even looks at GIT_TERMINAL_PROMPT.
+	t.Setenv("GIT_ASKPASS", askpass)
+	t.Setenv("SSH_ASKPASS", askpass)
+	desc := []byte("protocol=https\nhost=example.invalid\n\n")
+
+	// Control: a plain git in this environment does run the helper, so the
+	// assertion below is meaningful.
+	control := exec.Command("git", "credential", "fill")
+	control.Dir = base
+	control.Env = append(cleanGitEnv(), "GIT_ASKPASS="+askpass)
+	control.Stdin = bytes.NewReader(desc)
+	outb, err := control.CombinedOutput()
+	if err != nil || !strings.Contains(string(outb), "password=secret") || !pathExists(base, "marker") {
+		t.Skipf("git does not run GIT_ASKPASS here (err %v, marker %v):\n%s", err, pathExists(base, "marker"), outb)
+	}
+	if err := os.Remove(marker); err != nil {
+		t.Fatal(err)
+	}
+
+	// The backend's command line and environment must fail closed instead.
+	r, vaultDir := newGitVault(t, "https://example.invalid/me/vault.git", "m1")
+	if err := os.MkdirAll(vaultDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	g := r.(*gitRemote)
+	var lines []string
+	c := g.cmd(func(s string) { lines = append(lines, s) }, "credential", "fill")
+	c.Stdin = desc
+	_, err = execx.Real().Run(ctx, c)
+	err = g.classify(err)
+	if !errors.Is(err, ErrAuth) {
+		t.Fatalf("err = %v, want ErrAuth (terminal prompts disabled)", err)
+	}
+	if !strings.Contains(err.Error(), "terminal prompts disabled") || !strings.Contains(err.Error(), "authenticate once in a terminal: git -C "+g.dir+" fetch") {
+		t.Errorf("error lacks the classification hint: %v", err)
+	}
+	if pathExists(base, "marker") {
+		t.Error("the askpass helper was executed")
+	}
+	if slices.ContainsFunc(lines, func(s string) bool { return strings.Contains(s, "secret") }) {
+		t.Errorf("log leaks helper output: %v", lines)
 	}
 }

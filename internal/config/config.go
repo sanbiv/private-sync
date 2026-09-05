@@ -1,4 +1,12 @@
 // Package config loads, validates and saves the per-machine YAML configuration.
+//
+// Paths are stored exactly as typed in the file ("~/Work/myapp", not
+// "/Users/me/Work/myapp") so that Save writes back what the user wrote and the
+// same config.yaml can be copied between machines. Consumers must therefore
+// read paths through the accessor methods (VaultPath, KeyFilePath,
+// ProjectPath), which expand "~" and return absolute, cleaned paths; the raw
+// struct fields (Vault.Path, Key.File.Path, Projects[i].Path) are for display
+// and editing only.
 package config
 
 import (
@@ -11,8 +19,10 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -133,8 +143,19 @@ const FileMode fs.FileMode = 0o600
 // DirMode is the permission the config directory is created with.
 const DirMode fs.FileMode = 0o700
 
-// tempSuffix identifies config writes in the atomic temp file name.
-const tempSuffix = "cfg"
+// tempSeq numbers the temp files created by this process so that concurrent
+// Save calls (goroutines) never share a temp file either.
+var tempSeq atomic.Uint64
+
+// tempSuffix returns the suffix used for the atomic temp file of one Save
+// call. It embeds the process id and a per-process counter so that two
+// private-sync processes (or two goroutines) saving the config at the same
+// instant never open the same temp file: fsutil.WriteFileAtomic truncates an
+// existing temp file instead of failing, so a shared name could rename an
+// interleaved or half-written file over config.yaml.
+func tempSuffix() string {
+	return "cfg-" + strconv.Itoa(os.Getpid()) + "-" + strconv.FormatUint(tempSeq.Add(1), 10)
+}
 
 // Default returns a config with sensible defaults (remote none, prompt key source).
 func Default(d paths.Dirs) *Config {
@@ -213,10 +234,12 @@ func (c *Config) Save(path string) error {
 	if err != nil {
 		return err
 	}
-	if err := fsutil.EnsureDir(filepath.Dir(path)); err != nil {
+	// DirMode is applied here directly (not via fsutil.EnsureDir) so that the
+	// exported constant can never drift from the mode actually used.
+	if err := os.MkdirAll(filepath.Dir(path), DirMode); err != nil {
 		return fmt.Errorf("config: create directory: %w", err)
 	}
-	if err := fsutil.WriteFileAtomic(path, data, FileMode, tempSuffix); err != nil {
+	if err := fsutil.WriteFileAtomic(path, data, FileMode, tempSuffix()); err != nil {
 		return fmt.Errorf("config: write %s: %w", path, err)
 	}
 	return nil
@@ -263,8 +286,13 @@ func (c *Config) Validate() error {
 	}
 
 	// Vault.
+	vaultStable := false
 	if strings.TrimSpace(c.Vault.Path) == "" {
 		add("vault.path: required")
+	} else if !isStablePath(c.Vault.Path) {
+		add("vault.path: %q must be absolute or start with ~/ (a relative path would depend on the working directory)", c.Vault.Path)
+	} else {
+		vaultStable = true
 	}
 	if c.Vault.Remote.Type == "" {
 		c.Vault.Remote.Type = RemoteNone
@@ -310,8 +338,22 @@ func (c *Config) Validate() error {
 		add("key.source: unknown source %q (want prompt, file or bitwarden)", string(c.Key.Source))
 	}
 
+	// The key file path is checked whenever it is set, not only when the file
+	// source is selected: a stale but dangerous value should be reported
+	// before the user switches sources.
+	keyStable := false
+	if c.Key.File.Path != "" && !isStablePath(c.Key.File.Path) {
+		add("key.file.path: %q must be absolute or start with ~/ (a relative path would depend on the working directory)", c.Key.File.Path)
+	} else if c.Key.File.Path != "" {
+		keyStable = true
+	}
+
 	// Key file must never live inside the vault (it would be synced in clear).
-	if c.Key.File.Path != "" && c.Vault.Path != "" {
+	// The check only runs when both paths are stable: a relative path has
+	// already been reported above, and expanding it against the working
+	// directory could add a second, cwd-dependent and misleading error (e.g.
+	// when the command happens to run from inside the vault).
+	if keyStable && vaultStable {
 		keyPath, kerr := paths.ExpandHome(c.Key.File.Path)
 		vaultPath, verr := paths.ExpandHome(c.Vault.Path)
 		switch {
@@ -356,10 +398,15 @@ func (c *Config) Validate() error {
 				seen[id] = i
 			}
 		}
-		if strings.TrimSpace(p.Path) == "" {
+		switch {
+		case strings.TrimSpace(p.Path) == "":
 			add("projects[%d] (%s): path is required", i, projectLabel(p))
-		} else if _, err := paths.ExpandHome(p.Path); err != nil {
-			add("projects[%d] (%s): path: %v", i, projectLabel(p), err)
+		case !isStablePath(p.Path):
+			add("projects[%d] (%s): path %q must be absolute or start with ~/ (a relative path would depend on the working directory)", i, projectLabel(p), p.Path)
+		default:
+			if _, err := paths.ExpandHome(p.Path); err != nil {
+				add("projects[%d] (%s): path: %v", i, projectLabel(p), err)
+			}
 		}
 	}
 
@@ -370,26 +417,29 @@ func (c *Config) Validate() error {
 }
 
 // Warnings returns non-fatal validation warnings (e.g. key file inside a project).
+// Paths that are empty or not stable (relative, see isStablePath) are skipped:
+// Validate already reports them as hard errors, and comparing them after
+// expansion against the working directory would yield cwd-dependent warnings.
 func (c *Config) Warnings() []string {
 	if c == nil {
 		return nil
 	}
 	var out []string
 	keyPath := ""
-	if c.Key.File.Path != "" {
+	if isStablePath(c.Key.File.Path) {
 		if kp, err := paths.ExpandHome(c.Key.File.Path); err == nil {
 			keyPath = kp
 		}
 	}
 	vaultPath := ""
-	if c.Vault.Path != "" {
+	if isStablePath(c.Vault.Path) {
 		if vp, err := paths.ExpandHome(c.Vault.Path); err == nil {
 			vaultPath = vp
 		}
 	}
 	byPath := make(map[string]string, len(c.Projects))
 	for _, p := range c.Projects {
-		if p.Path == "" {
+		if !isStablePath(p.Path) {
 			continue
 		}
 		pp, err := paths.ExpandHome(p.Path)
@@ -448,21 +498,20 @@ func (c *Config) MaxFileSize() (int64, error) {
 var sizeRe = regexp.MustCompile(`^([0-9]*\.?[0-9]+)\s*([A-Za-z]*)$`)
 
 // sizeUnits maps a lower-cased unit suffix to its multiplier. Decimal units
-// (kb, mb, gb, tb) are powers of 1000; binary units (kib, mib, gib, tib) and
-// the bare letters (k, m, g, t) are powers of 1024.
+// (kb, mb, gb, tb) are powers of 1000; binary units (kib, mib, gib, tib) are
+// powers of 1024. Bare letters ("2M", "2k") are deliberately NOT accepted:
+// tools disagree on whether they mean 1000 or 1024, so a hand-edited config
+// would get a silently different limit. ParseSize reports them as an unknown
+// unit and lists the accepted spellings.
 var sizeUnits = map[string]int64{
 	"":    1,
 	"b":   1,
-	"k":   1 << 10,
 	"kb":  1000,
 	"kib": 1 << 10,
-	"m":   1 << 20,
 	"mb":  1000 * 1000,
 	"mib": 1 << 20,
-	"g":   1 << 30,
 	"gb":  1000 * 1000 * 1000,
 	"gib": 1 << 30,
-	"t":   1 << 40,
 	"tb":  1000 * 1000 * 1000 * 1000,
 	"tib": 1 << 40,
 }
@@ -470,6 +519,7 @@ var sizeUnits = map[string]int64{
 // ParseSize parses "512", "2MiB", "1.5MB", "300KiB", "1GiB" (case-insensitive).
 // Decimal units (KB, MB, GB, TB) are powers of 1000, binary units (KiB, MiB,
 // GiB, TiB) powers of 1024; whitespace between number and unit is allowed.
+// Ambiguous bare-letter units ("2M") are rejected, see sizeUnits.
 func ParseSize(s string) (int64, error) {
 	t := strings.TrimSpace(s)
 	if t == "" {
@@ -502,12 +552,19 @@ func ParseSize(s string) (int64, error) {
 	if v >= math.MaxInt64 {
 		return 0, fmt.Errorf("invalid size %q: too large", s)
 	}
-	n := int64(math.Round(v))
-	if mult == 1 && float64(n) != f {
+	// A fractional value must land on a whole number of bytes whatever the
+	// unit: "1.5" (1.5 bytes) and "1.0001KB" (1000.1 bytes) are both rejected
+	// rather than silently rounded. The tolerance absorbs binary floating
+	// point noise (e.g. 0.1 * 1e9), which is far below one byte.
+	if math.Abs(v-math.Round(v)) > fractionalByteTolerance {
 		return 0, fmt.Errorf("invalid size %q: fractional bytes", s)
 	}
-	return n, nil
+	return int64(math.Round(v)), nil
 }
+
+// fractionalByteTolerance is the largest distance from a whole number of
+// bytes that ParseSize still treats as rounding noise rather than a fraction.
+const fractionalByteTolerance = 1e-6
 
 // FormatSize renders n in the largest binary unit that divides it exactly
 // (e.g. 2097152 -> "2MiB", 1536 -> "1536"), the inverse of ParseSize.
@@ -618,15 +675,38 @@ scan:
   # include: [".env", ".env.*", "*.pem"]   # optional: a non-empty list replaces the built-in defaults
   # exclude_dirs: [".git", "node_modules"]
   # exclude_files: ["package-lock.json"]
-  max_file_size: 2MiB
+  max_file_size: 2MiB             # plain bytes, KB/MB/GB (x1000) or KiB/MiB/GiB (x1024); "2M" is rejected as ambiguous
 projects:
   - id: 3f2a9c1e5b7d0a46          # vault project id (opaque)
     name: myapp                   # informational, written by the program, never read for identity
     path: ~/Work/myapp            # local path on THIS machine
 `
 
-// isWithin reports whether child equals dir or lies beneath it (both absolute, cleaned).
+// isStablePath reports whether p resolves to the same directory no matter
+// where private-sync is launched from: it is absolute, or it is "~" / starts
+// with "~/" (which paths.ExpandHome resolves against the home directory).
+// Anything else ("vault", "./vault", "~bob/vault") is resolved by
+// paths.ExpandHome against the current working directory, so the same config
+// would point at different places from a shell and from cron.
+func isStablePath(p string) bool {
+	return p == "~" || strings.HasPrefix(p, "~/") || strings.HasPrefix(p, `~\`) || filepath.IsAbs(p)
+}
+
+// caseInsensitivePaths reports whether the platform's default filesystem
+// ignores case (macOS APFS/HFS+ and Windows NTFS). On such systems
+// "~/Vault/key" and "~/vault" name the same directory, so containment checks
+// must fold case or a key file could slip into the vault unnoticed. The rare
+// case-sensitive volume on these platforms gets a false positive at worst,
+// which is the safer failure for a check that guards the passphrase file.
+var caseInsensitivePaths = runtime.GOOS == "darwin" || runtime.GOOS == "windows"
+
+// isWithin reports whether child equals dir or lies beneath it (both absolute,
+// cleaned). On platforms whose filesystems are case-insensitive by default the
+// comparison folds case (see caseInsensitivePaths); elsewhere it is byte-wise.
 func isWithin(dir, child string) bool {
+	if caseInsensitivePaths {
+		dir, child = strings.ToLower(dir), strings.ToLower(child)
+	}
 	rel, err := filepath.Rel(dir, child)
 	if err != nil {
 		return false

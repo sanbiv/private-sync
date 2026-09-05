@@ -35,6 +35,7 @@ var (
 		"could not read password",
 		"authentication failed",
 		"terminal prompts disabled",
+		"user interactivity has been disabled", // Git Credential Manager with GCM_INTERACTIVE=never
 		"invalid username or password",
 		"invalid username or token",
 		"access denied",
@@ -60,8 +61,16 @@ var (
 		"couldn't connect to server",
 		"ssh: connect to host",
 	}
-	// gitRejectPatterns (lower-case) mark a push rejected as non-fast-forward.
-	gitRejectPatterns = []string{"rejected", "non-fast-forward", "fetch first"}
+	// gitRejectPatterns (lower-case) mark a push rejected because the remote
+	// branch moved: only those are worth a fetch + rebase + retry. The bare
+	// token "[rejected]" is git's own marker for a local non-fast-forward
+	// refusal; "[remote rejected]" (hooks, protected branches) does not match
+	// it and is not retried.
+	gitRejectPatterns = []string{"non-fast-forward", "fetch first", "stale info", "[rejected]"}
+	// gitInitNoBranchPatterns (lower-case) mean `git init -b` is unsupported.
+	gitInitNoBranchPatterns = []string{"unknown switch", "unknown option"}
+	// gitNoSuchRemotePatterns (lower-case) mean `git remote get-url` found no remote.
+	gitNoSuchRemotePatterns = []string{"no such remote"}
 
 	mergeConflictRe = regexp.MustCompile(`(?m)Merge conflict in (.+?)\s*$`)
 )
@@ -132,20 +141,137 @@ func (g *gitRemote) configArgs() []string {
 		"-c", "commit.gpgsign=false",
 		"-c", "core.autocrlf=false",
 		"-c", "core.hooksPath=" + g.nullDevice,
+		"-c", "core.askPass=", // see gitEnv: no askpass program, ever
 	}
 }
 
 // gitEnv is the extra environment every git invocation gets: no prompts,
 // English messages, and ssh in batch mode (never asks for keys or host keys).
+//
+// GIT_TERMINAL_PROMPT=0 alone is not enough: git consults GIT_ASKPASS, then
+// core.askPass, then SSH_ASKPASS before it even looks at that variable, and
+// IDE terminals (VS Code, JetBrains, GitHub Desktop) export GIT_ASKPASS so an
+// HTTPS fetch would pop a GUI prompt. An empty askpass program disables the
+// whole chain (git treats "" as "no program"), and later entries win over the
+// inherited environment. GCM_INTERACTIVE=never keeps Git Credential Manager
+// from opening a browser; its refusal is classified as ErrAuth.
 func gitEnv() []string {
-	ssh := strings.TrimSpace(os.Getenv("GIT_SSH_COMMAND"))
+	return []string{
+		"GIT_TERMINAL_PROMPT=0",
+		"GIT_ASKPASS=",
+		"SSH_ASKPASS=",
+		"GCM_INTERACTIVE=never",
+		"LC_ALL=C",
+		"GIT_SSH_COMMAND=" + sshCommand(os.Getenv("GIT_SSH_COMMAND")),
+	}
+}
+
+// sshBatchModeRe matches an ssh BatchMode option in any spelling the user may
+// have put into GIT_SSH_COMMAND (-o BatchMode=no, -oBatchMode=NO,
+// -o "BatchMode no"), together with the whitespace before it.
+var sshBatchModeRe = regexp.MustCompile(`(?i)\s*-o\s*["']?batchmode[=\s]+[^\s"']*["']?`)
+
+// sshCommand returns the user's GIT_SSH_COMMAND (or "ssh") forced into batch
+// mode. ssh honours the FIRST value given for an option, so an existing
+// "-o BatchMode=no" would win over an appended "-o BatchMode=yes": every
+// BatchMode option the user set is stripped first, then ours is appended.
+func sshCommand(userCmd string) string {
+	ssh := strings.TrimSpace(sshBatchModeRe.ReplaceAllString(strings.TrimSpace(userCmd), ""))
 	if ssh == "" {
 		ssh = "ssh"
 	}
-	if !strings.Contains(ssh, "BatchMode=") {
-		ssh += " -o BatchMode=yes"
+	return ssh + " -o BatchMode=yes"
+}
+
+// env is gitEnv plus the explicit location of the vault repository:
+// GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE, GIT_COMMON_DIR and
+// GIT_OBJECT_DIRECTORY always name the vault and GIT_ALTERNATE_OBJECT_DIRECTORIES
+// is empty, so a git environment inherited from a hook (receive-pack's
+// quarantine exports the object directories) or an outer git command can never
+// redirect `git add`/`commit`/`fetch` into another repository's object store.
+// Later entries win over inherited ones.
+func (g *gitRemote) env() []string {
+	gitDir := resolveGitDir(g.dir)
+	common := resolveCommonDir(gitDir)
+	return append(gitEnv(),
+		"GIT_DIR="+gitDir,
+		"GIT_WORK_TREE="+g.dir,
+		"GIT_INDEX_FILE="+filepath.Join(gitDir, "index"),
+		"GIT_COMMON_DIR="+common,
+		"GIT_OBJECT_DIRECTORY="+filepath.Join(common, "objects"),
+		"GIT_ALTERNATE_OBJECT_DIRECTORIES=",
+	)
+}
+
+// resolveCommonDir returns the directory holding the repository's shared
+// files (objects, refs, config): gitDir itself, or the target of
+// <gitDir>/commondir (relative to gitDir) when the vault is a linked worktree.
+func resolveCommonDir(gitDir string) string {
+	data, err := os.ReadFile(filepath.Join(gitDir, "commondir"))
+	if err != nil {
+		return gitDir
 	}
-	return []string{"GIT_TERMINAL_PROMPT=0", "LC_ALL=C", "GIT_SSH_COMMAND=" + ssh}
+	line, _, _ := strings.Cut(string(data), "\n")
+	target := strings.TrimSpace(filepath.FromSlash(line))
+	if target == "" {
+		return gitDir
+	}
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(gitDir, target)
+	}
+	return filepath.Clean(target)
+}
+
+// resolveGitDir returns the repository directory of the vault: <dir>/.git,
+// or the target of a gitfile ("gitdir: <path>", relative to dir) when .git
+// is a file. A missing or unreadable .git yields <dir>/.git.
+func resolveGitDir(dir string) string {
+	def := filepath.Join(dir, ".git")
+	st, err := os.Stat(def)
+	if err != nil || st.IsDir() {
+		return def
+	}
+	data, err := os.ReadFile(def)
+	if err != nil {
+		return def
+	}
+	line, _, _ := strings.Cut(string(data), "\n")
+	target, ok := strings.CutPrefix(strings.TrimSpace(line), "gitdir:")
+	target = strings.TrimSpace(filepath.FromSlash(target))
+	if !ok || target == "" {
+		return def
+	}
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(dir, target)
+	}
+	return filepath.Clean(target)
+}
+
+// urlUserinfoRe matches the userinfo of a URL ("https://user:token@host"):
+// git URLs may embed tokens that must not reach logs or error messages.
+var urlUserinfoRe = regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.\-]*://)[^/@\s]+@`)
+
+// redactText masks credentials embedded in URLs.
+func redactText(s string) string { return urlUserinfoRe.ReplaceAllString(s, "${1}***@") }
+
+// redactedError presents an error with URL credentials masked while still
+// unwrapping to the original (errors.Is / errors.As keep working).
+type redactedError struct{ cause error }
+
+func (e *redactedError) Error() string { return redactText(e.cause.Error()) }
+
+// Unwrap exposes the original error.
+func (e *redactedError) Unwrap() error { return e.cause }
+
+// redactErr wraps err when its message embeds URL credentials.
+func redactErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	if msg := err.Error(); redactText(msg) != msg {
+		return &redactedError{cause: err}
+	}
+	return err
 }
 
 // cmd builds the execx.Cmd for a git invocation inside the vault.
@@ -155,21 +281,22 @@ func (g *gitRemote) cmd(log func(string), args ...string) execx.Cmd {
 		Name:  "git",
 		Args:  full,
 		Dir:   g.dir,
-		Env:   gitEnv(),
+		Env:   g.env(),
 		Stdin: nil,
 		OnStderr: func(line string) {
 			if strings.TrimSpace(line) != "" {
-				log("git: " + line)
+				log("git: " + redactText(line))
 			}
 		},
 	}
 }
 
-// run executes git with args and classifies failures (auth / network).
+// run executes git with args and classifies failures (auth / network);
+// credentials embedded in URLs never reach the log or the error message.
 func (g *gitRemote) run(ctx context.Context, log func(string), args ...string) (execx.Result, error) {
-	log("$ git " + strings.Join(args, " "))
+	log("$ git " + redactText(strings.Join(args, " ")))
 	res, err := g.runner.Run(ctx, g.cmd(log, args...))
-	return res, g.classify(err)
+	return res, redactErr(g.classify(err))
 }
 
 // classify wraps auth and network failures with their sentinels and a hint.
@@ -194,7 +321,9 @@ func (g *gitRemote) classify(err error) error {
 	return err
 }
 
-// isRejected reports whether a push failure is a non-fast-forward rejection.
+// isRejected reports whether a push failure is a non-fast-forward rejection
+// (the remote branch moved), i.e. one that a fetch + rebase can resolve.
+// Server-side refusals ("[remote rejected]", hooks, protected branches) are not.
 func isRejected(err error) bool {
 	return containsAny(stderrOf(err), gitRejectPatterns)
 }
@@ -215,13 +344,16 @@ func (g *gitRemote) requireRepo() error {
 	return nil
 }
 
-// refExists runs `git rev-parse --verify -q <ref>`; exit 1 means absent.
+// refExists runs `git rev-parse --verify -q <ref>` (ref may be "<rev>:<path>").
+// Only exit status 1 means "absent"; anything else (128: not a repository,
+// corrupt refs, bad objects) is an error, so a broken repository is never
+// mistaken for an empty remote or an unborn branch.
 func (g *gitRemote) refExists(ctx context.Context, log func(string), ref string) (bool, error) {
 	_, err := g.run(ctx, log, "rev-parse", "--verify", "-q", ref)
 	switch {
 	case err == nil:
 		return true, nil
-	case execx.ExitCode(err) > 0:
+	case exitedWith(err, 1):
 		return false, nil
 	default:
 		return false, err
@@ -256,8 +388,11 @@ func (g *gitRemote) Prepare(ctx context.Context, log func(string)) error {
 	if err := g.integrate(ctx, log); err != nil {
 		return err
 	}
-	// Written after integration so that a machine adopting an existing vault
-	// takes the committed copies instead of tripping checkout on untracked ones.
+	// Spec §10 lists the bootstrap files right after `git init`; they are
+	// deliberately written after integration instead: a machine adopting an
+	// existing vault then takes the committed copies, whereas untracked ones
+	// would make `checkout -B` refuse ("would be overwritten") and force the
+	// reset --hard fallback. The result is identical for a fresh vault.
 	for _, f := range bootstrapFiles() {
 		wrote, err := writeFileIfAbsent(filepath.Join(g.dir, f.name), []byte(f.content))
 		if err != nil {
@@ -281,8 +416,8 @@ func (g *gitRemote) Prepare(ctx context.Context, log func(string)) error {
 func (g *gitRemote) initRepo(ctx context.Context, log func(string)) error {
 	if _, err := g.run(ctx, log, "init", "-b", g.branch); err == nil {
 		return nil
-	} else if execx.ExitCode(err) < 0 {
-		return err // git missing, context cancelled, ...
+	} else if !exitedWith(err, 129) && !containsAny(stderrOf(err), gitInitNoBranchPatterns) {
+		return err // git missing, context cancelled, permission denied, ...
 	}
 	log("git init -b unsupported; falling back to git init")
 	if _, err := g.run(ctx, log, "init"); err != nil {
@@ -325,7 +460,9 @@ func (g *gitRemote) ensureBranch(ctx context.Context, log func(string)) error {
 	return err
 }
 
-// ensureOrigin adds origin or repoints it at the configured url.
+// ensureOrigin adds origin or repoints it at the configured url. `git remote
+// get-url` exits 2 ("No such remote") when origin is missing; any other
+// failure (128: not a repository) is reported as is.
 func (g *gitRemote) ensureOrigin(ctx context.Context, log func(string)) error {
 	res, err := g.run(ctx, log, "remote", "get-url", "origin")
 	switch {
@@ -335,7 +472,7 @@ func (g *gitRemote) ensureOrigin(ctx context.Context, log func(string)) error {
 		}
 		_, err = g.run(ctx, log, "remote", "set-url", "origin", g.url)
 		return err
-	case execx.ExitCode(err) > 0:
+	case exitedWith(err, 2), containsAny(stderrOf(err), gitNoSuchRemotePatterns):
 		_, err = g.run(ctx, log, "remote", "add", "origin", g.url)
 		return err
 	default:
@@ -373,28 +510,38 @@ func (g *gitRemote) integrate(ctx context.Context, log func(string)) error {
 }
 
 // checkVaultID compares the local vault.json id with the remote's (§10.1).
+// A local vault.json is only ever replaced by the remote's when both ids can
+// be read and match; a file that cannot be shown to belong to the remote's
+// vault (different id, or unreadable on either side) is an error, so
+// adoption never silently overwrites it.
 func (g *gitRemote) checkVaultID(ctx context.Context, log func(string)) error {
+	localPath := filepath.Join(g.dir, "vault.json")
 	localID, present, err := localVaultID(g.dir)
 	if err != nil {
-		if present {
-			log("warning: local vault.json unreadable: " + err.Error())
+		if !present {
+			return fmt.Errorf("remote: read %s: %w", localPath, err)
 		}
-		return nil // the vault package reports unreadable files
+		return fmt.Errorf("remote: local %s is unreadable (%w); move it aside to open the remote vault", localPath, err)
 	}
 	if !present {
 		return nil
 	}
-	res, err := g.run(ctx, log, "show", g.originRef()+":vault.json")
+	remotePath := g.originRef() + ":vault.json"
+	exists, err := g.refExists(ctx, log, remotePath)
 	if err != nil {
-		if execx.ExitCode(err) > 0 {
-			return nil // remote history has no vault.json (yet)
-		}
+		return err
+	}
+	if !exists {
+		return nil // remote history has no vault.json (yet)
+	}
+	res, err := g.run(ctx, log, "show", remotePath)
+	if err != nil {
 		return err
 	}
 	remoteID, err := vaultID(res.Stdout)
 	if err != nil {
-		log("warning: remote vault.json unreadable: " + err.Error())
-		return nil
+		return fmt.Errorf("remote: vault.json on origin/%s is unreadable (%w); cannot verify it belongs to the same vault as %s",
+			g.branch, err, localPath)
 	}
 	if remoteID != localID {
 		return &VaultConflict{Dir: g.dir, LocalID: localID, RemoteID: remoteID}
