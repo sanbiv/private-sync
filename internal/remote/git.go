@@ -368,11 +368,18 @@ func (g *gitRemote) Prepare(ctx context.Context, log func(string)) error {
 	if err := os.MkdirAll(g.dir, 0o700); err != nil {
 		return fmt.Errorf("remote: create vault directory: %w", err)
 	}
+	adopting := true
 	if _, err := os.Stat(filepath.Join(g.dir, ".git")); err != nil {
 		if !errors.Is(err, fs.ErrNotExist) {
 			return fmt.Errorf("remote: %w", err)
 		}
+		adopting = false
 		if err := g.initRepo(ctx, log); err != nil {
+			return err
+		}
+	}
+	if adopting {
+		if err := g.checkAdoptable(ctx, log); err != nil {
 			return err
 		}
 	}
@@ -460,6 +467,89 @@ func (g *gitRemote) ensureBranch(ctx context.Context, log func(string)) error {
 	return err
 }
 
+// vaultTopLevel are the top-level names a vault directory may contain. A
+// repository at the vault path holding anything else is somebody else's.
+var vaultTopLevel = []string{
+	".git", vaultFileName, blobsDirName, "machines", "projects",
+	".gitattributes", ".gitignore",
+	".DS_Store", "desktop.ini", "Thumbs.db", // the noise .gitignore lists
+	".tmp.driveupload", ".tmp.drivedownload",
+}
+
+// isVaultEntry reports whether a top-level directory entry belongs to a vault.
+func isVaultEntry(name string) bool {
+	for _, v := range vaultTopLevel {
+		if name == v {
+			return true
+		}
+	}
+	return strings.HasPrefix(name, ".psv-tmp-")
+}
+
+// foreignEntries lists the top-level names in dir that are not vault files,
+// in directory order (os.ReadDir sorts them).
+func foreignEntries(dir string) ([]string, error) {
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, e := range ents {
+		if !isVaultEntry(e.Name()) {
+			out = append(out, e.Name())
+		}
+	}
+	return out, nil
+}
+
+// checkAdoptable refuses to take over a git repository that already exists at
+// the vault path but is not the vault's own.
+//
+// Everything Prepare and Push do afterwards assumes the repository is the
+// vault's: ensureOrigin repoints origin at the vault url, ensureBranch may
+// create and check out the vault branch, and Push runs `git add -A` plus a
+// push. Pointed at a project directory (an easy mistake in the setup wizard,
+// where a path is typed or tab-completed) that would repoint the project's
+// real origin and publish its whole working tree — including uncommitted work
+// and whatever secrets it holds — to the sync remote in plaintext.
+//
+// A repository counts as the vault's when origin already names the configured
+// url, or when the working tree holds nothing but vault files (a vault whose
+// first Prepare was interrupted before origin was set).
+func (g *gitRemote) checkAdoptable(ctx context.Context, log func(string)) error {
+	origin := ""
+	res, err := g.run(ctx, log, "remote", "get-url", "origin")
+	switch {
+	case err == nil:
+		origin = strings.TrimSpace(string(res.Stdout))
+		if origin == g.url {
+			return nil
+		}
+	case exitedWith(err, 2), containsAny(stderrOf(err), gitNoSuchRemotePatterns):
+		// No origin yet; the working tree has to vouch for the repository.
+	default:
+		return err
+	}
+	foreign, ferr := foreignEntries(g.dir)
+	if ferr != nil {
+		return fmt.Errorf("remote: %w", ferr)
+	}
+	if len(foreign) == 0 {
+		return nil
+	}
+	shown := foreign
+	if len(shown) > 5 {
+		shown = append(append([]string(nil), shown[:5]...), "...")
+	}
+	has := "it has no origin"
+	if origin != "" {
+		has = "its origin is " + redactText(origin)
+	}
+	return fmt.Errorf("remote: %s is already a git repository that is not this vault's (%s, and it contains %s); "+
+		"point the vault at an empty directory, or configure the remote url of that repository",
+		g.dir, has, strings.Join(shown, ", "))
+}
+
 // ensureOrigin adds origin or repoints it at the configured url. `git remote
 // get-url` exits 2 ("No such remote") when origin is missing; any other
 // failure (128: not a repository) is reported as is.
@@ -484,6 +574,9 @@ func (g *gitRemote) ensureOrigin(ctx context.Context, log func(string)) error {
 // nothing when the remote is empty, adoption when the local branch is unborn,
 // a rebase otherwise. A local vault.json for a different vault is refused.
 func (g *gitRemote) integrate(ctx context.Context, log func(string)) error {
+	if err := g.clearInterruptedRebase(ctx, log); err != nil {
+		return err
+	}
 	have, err := g.refExists(ctx, log, g.originRef())
 	if err != nil {
 		return err
@@ -515,7 +608,7 @@ func (g *gitRemote) integrate(ctx context.Context, log func(string)) error {
 // vault (different id, or unreadable on either side) is an error, so
 // adoption never silently overwrites it.
 func (g *gitRemote) checkVaultID(ctx context.Context, log func(string)) error {
-	localPath := filepath.Join(g.dir, "vault.json")
+	localPath := filepath.Join(g.dir, vaultFileName)
 	localID, present, err := localVaultID(g.dir)
 	if err != nil {
 		if !present {
@@ -526,7 +619,7 @@ func (g *gitRemote) checkVaultID(ctx context.Context, log func(string)) error {
 	if !present {
 		return nil
 	}
-	remotePath := g.originRef() + ":vault.json"
+	remotePath := g.originRef() + ":" + vaultFileName
 	exists, err := g.refExists(ctx, log, remotePath)
 	if err != nil {
 		return err
@@ -569,6 +662,47 @@ func (g *gitRemote) adopt(ctx context.Context, log func(string)) error {
 	return err
 }
 
+// rebaseInProgress reports whether the repository is stopped in the middle of
+// a rebase: git leaves rebase-merge (interactive/merge backend) or
+// rebase-apply (am backend) in the repository directory until it finishes,
+// is continued or is aborted.
+func (g *gitRemote) rebaseInProgress() bool {
+	gitDir := resolveGitDir(g.dir)
+	for _, name := range []string{"rebase-merge", "rebase-apply"} {
+		if _, err := os.Stat(filepath.Join(gitDir, name)); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+// clearInterruptedRebase aborts a rebase a previous run left behind.
+//
+// It must run before anything is committed: on a stopped rebase HEAD is
+// detached and the working tree may hold conflict markers, so `git add -A`
+// would commit corrupt .enc files into the vault — and the abort that
+// eventually follows would throw that commit away together with any new vault
+// file it swept up (a blob written since would simply disappear).
+func (g *gitRemote) clearInterruptedRebase(ctx context.Context, log func(string)) error {
+	if !g.rebaseInProgress() {
+		return nil
+	}
+	log("a previous rebase was interrupted; aborting it before touching the working tree")
+	if _, err := g.run(ctx, log, "rebase", "--abort"); err != nil {
+		return fmt.Errorf("remote: %s is stopped in the middle of a rebase and it could not be aborted (%w); "+
+			"run: git -C %s rebase --abort", g.dir, err, g.dir)
+	}
+	return nil
+}
+
+// abortRebase runs `git rebase --abort`, reporting a failure to the log only:
+// callers are already returning an error of their own.
+func (g *gitRemote) abortRebase(ctx context.Context, log func(string)) {
+	if _, err := g.run(ctx, log, "rebase", "--abort"); err != nil {
+		log("warning: git rebase --abort: " + err.Error())
+	}
+}
+
 // rebase replays local commits onto origin/<branch>; on failure the rebase is
 // aborted and the conflicting files are reported.
 func (g *gitRemote) rebase(ctx context.Context, log func(string)) error {
@@ -577,12 +711,17 @@ func (g *gitRemote) rebase(ctx context.Context, log func(string)) error {
 		return nil
 	}
 	if execx.ExitCode(err) < 0 {
+		// git was killed rather than exiting on its own: exec.CommandContext
+		// SIGKILLs it when the context is cancelled (esc during a fetch) and
+		// ProcessState.ExitCode() is -1 for a signalled process. The rebase
+		// may have stopped on a conflict first, so it is aborted here too --
+		// on a context that cannot be cancelled, or the abort process would
+		// never start.
+		g.abortRebase(context.WithoutCancel(ctx), log)
 		return err
 	}
 	files := g.conflictFiles(ctx, log, err)
-	if _, aerr := g.run(ctx, log, "rebase", "--abort"); aerr != nil {
-		log("warning: git rebase --abort: " + aerr.Error())
-	}
+	g.abortRebase(ctx, log)
 	if len(files) == 0 {
 		return fmt.Errorf("git rebase onto origin/%s failed: %w", g.branch, err)
 	}
@@ -639,8 +778,33 @@ func (g *gitRemote) commitDirty(ctx context.Context, log func(string)) error {
 	if strings.TrimSpace(string(res.Stdout)) == "" {
 		return nil
 	}
+	// `git add -A` would happily stage a half-merged file, conflict markers
+	// and all, and commit it into the vault. clearInterruptedRebase has
+	// already dealt with a stopped rebase, so anything unmerged left here is
+	// a merge the user has to finish.
+	if files := unmergedPaths(string(res.Stdout)); len(files) > 0 {
+		return fmt.Errorf("remote: %s has unmerged paths (%s) from an interrupted merge; "+
+			"resolve them or run: git -C %s merge --abort", g.dir, strings.Join(files, ", "), g.dir)
+	}
 	log("committing uncommitted local changes before rebasing")
 	return g.stageAndCommit(ctx, log)
+}
+
+// unmergedPaths lists the conflicted paths in `git status --porcelain` output:
+// the status codes with a U on either side, plus AA (both added) and DD (both
+// deleted), which git reports without one.
+func unmergedPaths(porcelain string) []string {
+	var out []string
+	for _, line := range strings.Split(porcelain, "\n") {
+		if len(line) < 4 {
+			continue
+		}
+		x, y := line[0], line[1]
+		if x == 'U' || y == 'U' || (x == 'A' && y == 'A') || (x == 'D' && y == 'D') {
+			out = append(out, strings.TrimSpace(line[2:]))
+		}
+	}
+	return out
 }
 
 // Fetch downloads origin/<branch> and rebases local history onto it
@@ -663,6 +827,11 @@ func (g *gitRemote) Push(ctx context.Context, written []string, log func(string)
 	_ = written
 	log = logger(log)
 	if err := g.requireRepo(); err != nil {
+		return err
+	}
+	// A fetch that was cancelled mid-rebase is only a warning to the caller,
+	// which then pushes anyway: never commit the half-merged tree it left.
+	if err := g.clearInterruptedRebase(ctx, log); err != nil {
 		return err
 	}
 	if err := g.stageAndCommit(ctx, log); err != nil {

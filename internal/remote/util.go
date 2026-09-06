@@ -132,7 +132,7 @@ func vaultID(data []byte) (string, error) {
 // localVaultID reads <dir>/vault.json and returns its id; ok is false when
 // the file does not exist. A present but unreadable file yields an error.
 func localVaultID(dir string) (id string, ok bool, err error) {
-	data, err := os.ReadFile(filepath.Join(dir, "vault.json"))
+	data, err := os.ReadFile(filepath.Join(dir, vaultFileName))
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return "", false, nil

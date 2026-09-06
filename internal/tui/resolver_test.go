@@ -1,12 +1,14 @@
 package tui
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/sanbiv/private-sync/internal/execx"
 	"github.com/sanbiv/private-sync/internal/merge"
 	"github.com/sanbiv/private-sync/internal/sync"
 )
@@ -434,8 +436,13 @@ func TestResolverEditRefusesWhileMarkersRemain(t *testing.T) {
 	if m.msg == "" {
 		t.Fatalf("expected a refusal message")
 	}
-	if _, err := os.Stat(mergePath); !os.IsNotExist(err) {
-		t.Fatalf("the scratch merge file should be removed even on refusal")
+	// The refusal must not destroy the file: it holds whatever the user
+	// already merged by hand, and the message tells them to press e again.
+	if _, err := os.Stat(mergePath); err != nil {
+		t.Fatalf("the scratch merge file must survive a refusal: %v", err)
+	}
+	if m.pendingEditPath != mergePath || m.pendingEditKey != it.Key {
+		t.Fatalf("the resolver should remember the kept scratch file, got %q for %+v", m.pendingEditPath, m.pendingEditKey)
 	}
 }
 
@@ -649,4 +656,135 @@ func TestResolverStartEditSplitsEditorArguments(t *testing.T) {
 	}
 	mergePath := filepath.Join(dir, "file.txt"+mergeTempSuffix)
 	os.Remove(mergePath)
+}
+
+// --- regressions -------------------------------------------------------------
+
+// TestEditorCommandSanitisesEnvironment is the regression for the TUI's
+// $EDITOR inheriting the process's full os.Environ(): the conflict editor
+// (and every plugin, LSP server or format-on-save hook it spawns) must not be
+// handed BW_SESSION, BW_PASSWORD & co., exactly as `config edit` does on the
+// CLI side.
+func TestEditorCommandSanitisesEnvironment(t *testing.T) {
+	for _, name := range execx.Denylist() {
+		t.Setenv(name, "super-secret-"+name)
+	}
+	t.Setenv("PATH_MARKER_FOR_TEST", "kept")
+
+	cmd := editorCommand("vim -u NONE", "/tmp/x"+mergeTempSuffix)
+	if cmd.Env == nil {
+		t.Fatalf("cmd.Env is nil: the editor would inherit the whole environment, secrets included")
+	}
+	denied := map[string]bool{}
+	for _, name := range execx.Denylist() {
+		denied[name] = true
+	}
+	kept := false
+	for _, kv := range cmd.Env {
+		k, _, _ := strings.Cut(kv, "=")
+		if denied[k] {
+			t.Fatalf("editor environment still carries %s", k)
+		}
+		if k == "PATH_MARKER_FOR_TEST" {
+			kept = true
+		}
+	}
+	if !kept {
+		t.Fatalf("the sanitised environment dropped ordinary variables too")
+	}
+	// The editor's own arguments must survive the change.
+	if len(cmd.Args) != 4 || cmd.Args[1] != "-u" || cmd.Args[2] != "NONE" || !strings.HasSuffix(cmd.Args[3], mergeTempSuffix) {
+		t.Fatalf("cmd.Args = %q, want the split editor arguments plus the merge path", cmd.Args)
+	}
+}
+
+// TestResolverEditKeepsPartialMergeForTheNextEdit is the regression for the
+// scratch file being deleted before the marker check: a partially merged file
+// was thrown away and the next `e` restarted from pristine markers, so every
+// pass over a big conflict had to be redone from zero.
+func TestResolverEditKeepsPartialMergeForTheNextEdit(t *testing.T) {
+	t.Setenv("EDITOR", "true")
+	it := textConflictItem()
+	dir := t.TempDir()
+	plan := &sync.Plan{Projects: []sync.ProjectPlan{{ID: "p1", Path: dir, Items: []sync.Item{it}}}}
+	m := NewResolver(plan, sync.Resolutions{})
+
+	next, _ := m.startEdit(&it) // user presses e
+	m = next.(*Resolver)
+	mergePath := filepath.Join(dir, "file.txt"+mergeTempSuffix)
+
+	rendered, err := os.ReadFile(mergePath)
+	if err != nil {
+		t.Fatalf("read scratch file: %v", err)
+	}
+	// The user merges part of the file and leaves the rest conflicted.
+	partial := append([]byte("HAND-MERGED HEADER\n"), rendered...)
+	if err := os.WriteFile(mergePath, partial, 0o600); err != nil {
+		t.Fatalf("write scratch file: %v", err)
+	}
+
+	next, _ = m.handleEditDone(editDoneMsg{path: mergePath, key: it.Key})
+	m = next.(*Resolver)
+	if !strings.Contains(m.msg, "conflict markers") {
+		t.Fatalf("msg = %q, want the refusal that asks for another e", m.msg)
+	}
+
+	next, _ = m.startEdit(&it) // user follows the advice and presses e again
+	m = next.(*Resolver)
+	after, err := os.ReadFile(mergePath)
+	if err != nil {
+		t.Fatalf("read scratch file on the second edit: %v", err)
+	}
+	if !bytes.Contains(after, []byte("HAND-MERGED HEADER")) {
+		t.Fatalf("the second edit restarted from pristine markers; the user's work was lost")
+	}
+
+	// Leaving the item must not leave the scratch file behind.
+	next, _ = m.handleEditDone(editDoneMsg{path: mergePath, key: it.Key})
+	m = next.(*Resolver)
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	if _, err := os.Stat(mergePath); !os.IsNotExist(err) {
+		t.Fatalf("the scratch file must not outlive the item, stat err = %v", err)
+	}
+}
+
+// TestResolverBulkStrategyStaysOnUndecidableItem is the regression for L/R
+// stepping straight over the item on screen when sync.ApplyStrategy declines
+// it (StrategyLocal with no local copy): the resolver used to report Done()
+// with that item silently unresolved.
+func TestResolverBulkStrategyStaysOnUndecidableItem(t *testing.T) {
+	a := sync.Item{
+		Key: sync.ItemKey{Project: "p1", Path: "a.env"}, Action: sync.ActionConflict,
+		Conflict: sync.ConflictConcurrent, Local: nil, NeedsResolution: true,
+	}
+	b := sync.Item{
+		Key: sync.ItemKey{Project: "p1", Path: "b.env"}, Action: sync.ActionConflict,
+		Conflict: sync.ConflictContent, Local: &sync.FileRef{Blob: "x"}, NeedsResolution: true,
+	}
+	plan := &sync.Plan{Projects: []sync.ProjectPlan{{ID: "p1", Items: []sync.Item{a, b}}}}
+	m := NewResolver(plan, sync.Resolutions{})
+
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'L'}})
+	m = next.(*Resolver)
+
+	if m.Done() {
+		t.Fatalf("L must not finish the resolver while a.env has no resolution")
+	}
+	cur := m.currentItem()
+	if cur == nil || cur.Key.Path != "a.env" {
+		t.Fatalf("resolver moved off the undecidable item, now on %v", cur)
+	}
+	if _, ok := m.Resolutions()[a.Key]; ok {
+		t.Fatalf("a.env should still be unresolved")
+	}
+	if m.msg == "" {
+		t.Fatalf("expected a message explaining why L could not decide this file")
+	}
+	if len(plan.Unresolved(m.Resolutions())) == 0 {
+		t.Fatalf("a.env must still count as unresolved")
+	}
+	// The rest of the plan is still resolved by the bulk strategy.
+	if _, ok := m.Resolutions()[b.Key]; !ok {
+		t.Fatalf("L should still have resolved b.env")
+	}
 }

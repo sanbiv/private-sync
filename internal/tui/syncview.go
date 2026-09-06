@@ -173,6 +173,16 @@ func (m *syncView) SetSize(width, height int) {
 // terminal stage.
 func (m *syncView) Update(msg tea.Msg) (*syncView, tea.Cmd) {
 	if m.stage == stageResolve && m.resolver != nil {
+		// Keep the spinner's tick chain alive across the resolve stage. The
+		// resolver drops spinner.TickMsg, and the only place that re-issues
+		// the next tick is the case below — so delegating the tick killed the
+		// chain for good and the apply/push spinner stayed on a single frame
+		// for the whole (longest, most write-heavy) part of the run.
+		if tick, ok := msg.(spinner.TickMsg); ok {
+			var cmd tea.Cmd
+			m.spin, cmd = m.spin.Update(tick)
+			return m, cmd
+		}
 		next, cmd := m.resolver.Update(msg)
 		if r, ok := next.(*Resolver); ok {
 			m.resolver = r

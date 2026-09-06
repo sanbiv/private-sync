@@ -67,6 +67,14 @@ var (
 		"code 401",
 		"code 403",
 	}
+	// rcloneNotFoundPatterns (lower-case) mark a missing object or folder for
+	// backends that report it with the generic exit status 1. They are
+	// deliberately specific: "file not found" alone would also match
+	// "config file not found", which must stay an error.
+	rcloneNotFoundPatterns = []string{
+		"object not found",
+		"directory not found",
+	}
 	rcloneNetworkPatterns = []string{
 		"no such host",
 		"connection refused",
@@ -277,16 +285,23 @@ func (r *rcloneRemote) Fetch(ctx context.Context, log func(string)) error {
 	return nil
 }
 
-// Push uploads the written blobs first (content addressed, so existing remote
-// copies are skipped), then this machine's own files plus the bootstrap files.
-// Nothing is ever deleted on the remote.
+// Push uploads, in this order: vault.json (only when this process wrote it),
+// the blob store (content addressed, so existing remote copies are skipped),
+// the vault bootstrap files, and this machine's own files. Nothing is ever
+// deleted or, except for a deliberate vault.json rewrite, replaced on the
+// remote.
 func (r *rcloneRemote) Push(ctx context.Context, written []string, log func(string)) error {
 	log = logger(log)
-	blobs := r.writtenBlobs(written, log)
-	if len(blobs) > 0 {
-		if err := r.copyList(ctx, log, blobs, "--no-traverse", "--ignore-existing"); err != nil {
-			return err
-		}
+	// First: a lost §10.1 race must be reported before this machine publishes
+	// anything else into the winner's vault.
+	if err := r.pushVaultFile(ctx, written, log); err != nil {
+		return err
+	}
+	if err := r.pushBlobs(ctx, log); err != nil {
+		return err
+	}
+	if err := r.pushBootstrap(ctx, log); err != nil {
+		return err
 	}
 	own, err := r.ownFiles()
 	if err != nil {
@@ -297,6 +312,111 @@ func (r *rcloneRemote) Push(ctx context.Context, written []string, log func(stri
 		return nil
 	}
 	return r.copyList(ctx, log, own, "--no-traverse")
+}
+
+// pushVaultFile uploads vault.json, but only when this process wrote it
+// (vault creation, or `passphrase change`).
+//
+// Spec §10.1 makes the remote copy authoritative and rewrites it only from
+// `passphrase change`. Uploading it on every push instead would let a stale
+// local copy replace another machine's freshly rewrapped key — `rclone copy`
+// is not `--update`, so an older source still overwrites the destination
+// whenever size or modtime differ — silently undoing the passphrase change.
+//
+// The remote copy is read back before it is replaced. A different vault id
+// means another machine created the vault concurrently and won the §10.1 race:
+// the winner's wrapped key is left alone and a *VaultConflict is returned, so
+// that the caller reports the race instead of destroying the winning vault
+// (the git backend surfaces the same situation as a rebase conflict). When the
+// remote holds no vault.json yet the upload uses --ignore-existing, so a copy
+// that landed in the meantime still wins and the read-back verification of the
+// creating machine catches it.
+func (r *rcloneRemote) pushVaultFile(ctx context.Context, written []string, log func(string)) error {
+	if !r.wroteVaultFile(written) {
+		return nil
+	}
+	localID, present, err := localVaultID(r.dir)
+	if err != nil {
+		return fmt.Errorf("remote: read %s: %w", filepath.Join(r.dir, vaultFileName), err)
+	}
+	if !present {
+		return nil // nothing to upload
+	}
+	remoteID, exists, err := r.remoteVaultID(ctx, log)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return r.copyList(ctx, log, []string{vaultFileName}, "--no-traverse", "--ignore-existing")
+	}
+	if remoteID != localID {
+		return &VaultConflict{Dir: r.dir, LocalID: localID, RemoteID: remoteID}
+	}
+	return r.copyList(ctx, log, []string{vaultFileName}, "--no-traverse")
+}
+
+// wroteVaultFile reports whether written names the vault file.
+func (r *rcloneRemote) wroteVaultFile(written []string) bool {
+	for _, w := range written {
+		if rel, ok := vaultRel(r.dir, w); ok && rel == vaultFileName {
+			return true
+		}
+	}
+	return false
+}
+
+// remoteVaultID reads the id of the vault.json on the remote; exists is false
+// when the remote has none yet.
+func (r *rcloneRemote) remoteVaultID(ctx context.Context, log func(string)) (id string, exists bool, err error) {
+	res, err := r.run(ctx, log, "cat", r.target(vaultFileName))
+	if err != nil {
+		if exitedWith(err, rcloneExitDirNotFound) || exitedWith(err, rcloneExitFileNotFound) ||
+			containsAny(stderrOf(err), rcloneNotFoundPatterns) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	id, err = vaultID(res.Stdout)
+	if err != nil {
+		return "", true, fmt.Errorf("remote: %s on %s is unreadable (%w); cannot verify it belongs to the same vault as %s",
+			vaultFileName, r.target(""), err, filepath.Join(r.dir, vaultFileName))
+	}
+	return id, true, nil
+}
+
+// pushBlobs uploads the whole local blob store with --ignore-existing.
+//
+// The list is deliberately not derived from `written`. A Push that fails after
+// the blobs were transferred leaves them local-only forever: the journals that
+// reference them are rebuilt from disk by ownFiles on every later run and get
+// published, while the blobs — absent from a later process's Written() — never
+// are, so every other machine reports a permanently pending blob. Blobs are
+// content addressed, so a remote copy is always identical and --ignore-existing
+// skips it; the traversal costs no more than the one Fetch already pays on
+// every run.
+func (r *rcloneRemote) pushBlobs(ctx context.Context, log func(string)) error {
+	src := filepath.Join(r.dir, blobsDirName)
+	if isEmptyDir(src) {
+		return nil
+	}
+	_, err := r.run(ctx, log, "copy", src, r.target(blobsDirName), "--ignore-existing")
+	return err
+}
+
+// pushBootstrap uploads the vault bootstrap files, never replacing the remote
+// copies: their content is fixed, so a machine that did not write them must
+// not push its own copy over an edited one.
+func (r *rcloneRemote) pushBootstrap(ctx context.Context, log func(string)) error {
+	var files []string
+	for _, f := range bootstrapFiles() {
+		if isRegularFile(filepath.Join(r.dir, f.name)) {
+			files = append(files, f.name)
+		}
+	}
+	if len(files) == 0 {
+		return nil
+	}
+	return r.copyList(ctx, log, files, "--no-traverse", "--ignore-existing")
 }
 
 // copyList runs `rclone copy <vault> <target> --files-from <tmp> <extra...>`
@@ -336,29 +456,22 @@ func (r *rcloneRemote) writeList(paths []string) (string, error) {
 	return name, nil
 }
 
-// writtenBlobs selects the blob paths among written that exist locally,
-// deduplicated and sorted.
-func (r *rcloneRemote) writtenBlobs(written []string, log func(string)) []string {
-	seen := map[string]bool{}
-	var out []string
-	for _, w := range written {
-		rel, ok := vaultRel(r.dir, w)
-		if !ok || !strings.HasPrefix(rel, "blobs/") || seen[rel] {
-			continue
-		}
-		seen[rel] = true // examine (and log) each path once, present or not
-		if !isRegularFile(filepath.Join(r.dir, filepath.FromSlash(rel))) {
-			log("skipping missing blob " + rel)
-			continue
-		}
-		out = append(out, rel)
+// isEmptyDir reports whether name is missing, unreadable or holds no entries.
+func isEmptyDir(name string) bool {
+	f, err := os.Open(name)
+	if err != nil {
+		return true
 	}
-	sort.Strings(out)
-	return out
+	defer f.Close()
+	names, _ := f.Readdirnames(1)
+	return len(names) == 0
 }
 
-// ownFiles expands OwnFiles(machineID) to the concrete files present locally
-// and adds the bootstrap files when present.
+// ownFiles expands OwnFiles(machineID) to the concrete files present locally.
+//
+// vault.json and the bootstrap files are deliberately not part of it: they are
+// pushed by pushVaultFile / pushBootstrap, which never replace a remote copy
+// this machine did not write.
 //
 // The patterns are matched relative to the vault (fs.Glob over os.DirFS)
 // rather than joined onto the absolute vault path: a vault directory whose
@@ -376,11 +489,6 @@ func (r *rcloneRemote) ownFiles() ([]string, error) {
 			if isRegularFile(filepath.Join(r.dir, filepath.FromSlash(m))) {
 				out = append(out, m)
 			}
-		}
-	}
-	for _, name := range []string{"vault.json", ".gitattributes", ".gitignore"} {
-		if isRegularFile(filepath.Join(r.dir, name)) {
-			out = append(out, name)
 		}
 	}
 	sort.Strings(out)

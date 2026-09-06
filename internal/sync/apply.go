@@ -678,10 +678,13 @@ func (ap *applier) conflict(it *Item) error {
 		}
 		content = it.LocalText
 	case ChooseRemote:
-		if it.HeadText == nil {
-			return errors.New("no vault content to take")
+		// Not "it.HeadText == nil": a zero-length vault version reads back as a
+		// nil slice, and taking the remote side of an empty file must work.
+		text, err := ap.headContent(it)
+		if err != nil {
+			return err
 		}
-		content = it.HeadText
+		content = text
 	case ChooseCustom:
 		if r.Content == nil {
 			return errors.New("custom resolution without content")

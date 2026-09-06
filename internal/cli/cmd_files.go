@@ -157,7 +157,36 @@ func (c *cli) filesAdd(cmd *cobra.Command, ref string, paths []string) error {
 	for _, r := range rels {
 		opts.Track[sync.ItemKey{Project: p.ID, Path: r}] = true
 	}
-	return c.syncWith(ctx, s, opts, nil)
+	syncErr := c.syncWith(ctx, s, opts, nil)
+	// The planner may refuse a requested path (too large, unreadable, a
+	// conflicting head): the item is then reported only and nothing is
+	// uploaded, so the exit status must not claim the files are protected.
+	if err := untrackedPaths(s, p.ID, rels); err != nil {
+		if syncErr != nil {
+			return fmt.Errorf("%v; %w", err, syncErr)
+		}
+		return err
+	}
+	return syncErr
+}
+
+// untrackedPaths reports the requested paths whose vault head is still not a
+// file after `files add` (nothing was tracked for them).
+func untrackedPaths(s *app.Session, projectID string, rels []string) error {
+	tracked, err := s.Engine.TrackedPaths(projectID)
+	if err != nil {
+		return fmt.Errorf("check the tracked files: %w", err)
+	}
+	var missed []string
+	for _, r := range rels {
+		if !tracked[r] {
+			missed = append(missed, r)
+		}
+	}
+	if len(missed) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%d file(s) not tracked: %s (see the report above)", len(missed), strings.Join(missed, ", "))
 }
 
 // filesRm untracks paths everywhere; local copies are never touched.
@@ -229,11 +258,19 @@ func (c *cli) filesDelete(cmd *cobra.Command, ref string, paths []string, remove
 				}
 				continue
 			}
+			// Spec §13: the pre-image reaches the encrypted trash before the
+			// last plaintext copy is removed. An unreadable file or a failed
+			// TrashPut therefore keeps the local file (Apply does the same,
+			// internal/sync/apply.go).
 			if st.Mode().IsRegular() {
-				if content, err := os.ReadFile(full); err == nil {
-					if _, err := s.State.TrashPut(s.Vault.Keys(), p.ID, r, content, uint32(st.Mode().Perm())); err != nil {
-						c.warn(fmt.Sprintf("%s: could not save a copy in the trash: %v", r, err))
-					}
+				content, err := os.ReadFile(full)
+				if err != nil {
+					c.warn(fmt.Sprintf("%s: could not be read to save a copy in the trash (%v): local copy kept", r, err))
+					continue
+				}
+				if _, err := s.State.TrashPut(s.Vault.Keys(), p.ID, r, content, uint32(st.Mode().Perm())); err != nil {
+					c.warn(fmt.Sprintf("%s: could not save a copy in the trash (%v): local copy kept", r, err))
+					continue
 				}
 			}
 			if err := os.Remove(full); err != nil {

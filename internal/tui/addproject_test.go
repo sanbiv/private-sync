@@ -883,3 +883,46 @@ func TestAddProgramViewShowsQuitConfirmWarning(t *testing.T) {
 		t.Fatalf("View() should show the quit-confirmation warning while armed")
 	}
 }
+
+// TestUpdateIdentifyCancelsContextOnCompletion is identify's counterpart to
+// TestUpdateFetchCancelsContextOnCompletion: updateIdentify used to call
+// identCancel only on esc, so every completed identify left an uncancelled
+// child registered on the long-lived program context for the rest of the
+// session (and goBack skips stepIdentify, so esc never reached it either).
+func TestUpdateIdentifyCancelsContextOnCompletion(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		msg  identifyMsg
+	}{
+		{"success", identifyMsg{gen: 1}}, // no matches -> stepScan
+		{"failure", identifyMsg{gen: 1, err: errors.New("boom")}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &addModel{ctx: context.Background(), s: &app.Session{}, step: stepIdentify, identGen: 1}
+			ctx, cancel := context.WithCancel(m.ctx)
+			m.identCtx, m.identCancel = ctx, cancel
+
+			m.Update(tc.msg)
+
+			if ctx.Err() != context.Canceled {
+				t.Fatalf("a finished identify must cancel its child context, err = %v", ctx.Err())
+			}
+		})
+	}
+}
+
+// TestUpdateIdentifyStaleGenerationKeepsItsContext guards the ordering: a
+// stale message (from an identify esc already cancelled) must be dropped
+// before the cancel, so it cannot cancel the *current* identify's context.
+func TestUpdateIdentifyStaleGenerationKeepsItsContext(t *testing.T) {
+	m := &addModel{ctx: context.Background(), s: &app.Session{}, step: stepIdentify, identGen: 2}
+	ctx, cancel := context.WithCancel(m.ctx)
+	defer cancel()
+	m.identCtx, m.identCancel = ctx, cancel
+
+	m.Update(identifyMsg{gen: 1}) // stale
+
+	if ctx.Err() != nil {
+		t.Fatalf("a stale identify message must not cancel the live identify, err = %v", ctx.Err())
+	}
+}

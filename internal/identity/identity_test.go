@@ -1059,3 +1059,143 @@ func TestFingerprintString(t *testing.T) {
 		t.Errorf("empty String = %q", s)
 	}
 }
+
+// ---- Regressions -------------------------------------------------------------
+
+// A multi-line TOML string must be consumed as a unit: its body may otherwise
+// look like a section header or a key and shadow the real name.
+func TestParseTOMLSections_MultilineStrings(t *testing.T) {
+	in := "[package]\n" +
+		"description = \"\"\"\n[package]\nname = \"evil\"\n\"\"\"\n" +
+		"readme = '''\nname = \"also-evil\"\n'''\n" +
+		"name = \"real\"\n" +
+		"[other]\nname = \"other\"\n"
+	got := parseTOMLSections(in)
+	tests := []struct{ section, key, want string }{
+		{"package", "name", "real"},
+		{"package", "description", "[package]\nname = \"evil\""},
+		{"package", "readme", "name = \"also-evil\""},
+		{"other", "name", "other"},
+	}
+	for _, tt := range tests {
+		if g := got.get(tt.section, tt.key); g != tt.want {
+			t.Errorf("get(%q,%q) = %q, want %q", tt.section, tt.key, g, tt.want)
+		}
+	}
+	// An unterminated multi-line string swallows the rest of the file rather
+	// than letting its body retarget the parse.
+	un := parseTOMLSections("[package]\ndescription = \"\"\"\n[package]\nname = \"evil\"\n")
+	if g := un.get("package", "name"); g != "" {
+		t.Errorf("unterminated: package.name = %q, want %q", g, "")
+	}
+}
+
+func TestDetect_ManifestMultilineStrings(t *testing.T) {
+	tests := []struct {
+		name  string
+		files map[string]string
+		want  []string
+	}{
+		{"cargo section reentry", map[string]string{"Cargo.toml": "[package]\ndescription = \"\"\"\n[package]\nname = \"evil\"\n\"\"\"\nname = \"real\"\n"}, []string{"cargo:real"}},
+		{"cargo literal string", map[string]string{"Cargo.toml": "[package]\ndescription = '''\nname = \"evil\"\n'''\nname = \"mycrate\"\n"}, []string{"cargo:mycrate"}},
+		{"cargo markdown body", map[string]string{"Cargo.toml": "[package]\ndescription = \"\"\"\n[docs](https://d.rs)\n\"\"\"\nname = \"mycrate\"\n"}, []string{"cargo:mycrate"}},
+		{"cargo toml snippet body", map[string]string{"Cargo.toml": "[package]\ndescription = \"\"\"\nAdd to Cargo.toml:\n\n    [dependencies]\n    name = \"other\"\n\"\"\"\nname = \"mycrate\"\n"}, []string{"cargo:mycrate"}},
+		{"pyproject section reentry", map[string]string{"pyproject.toml": "[project]\nreadme = \"\"\"\n[project]\nname = \"evil-py\"\n\"\"\"\nname = \"Real-Py\"\n"}, []string{"py:real-py"}},
+		{"single line multiline still works", map[string]string{"Cargo.toml": "[package]\nname = \"\"\"inline\"\"\"\n"}, []string{"cargo:inline"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			for name, content := range tt.files {
+				writeFile(t, filepath.Join(dir, name), content)
+			}
+			got, err := Detect(context.Background(), dir, failingRunner(nil))
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertFps(t, got, append(append([]string{}, tt.want...), "dir:"+filepath.Base(dir)))
+		})
+	}
+}
+
+// git accepts a variable on the same line as its section header; dropping it
+// would lose the git fingerprint entirely in the no-git fallback.
+func TestParseGitConfigRemotes_SameLineVariable(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want []string
+	}{
+		{"same line", "[remote \"origin\"] url = git@github.com:a/b.git\n", []string{"git@github.com:a/b.git"}},
+		{"same line no spaces", "[remote \"origin\"]url=git@github.com:a/b.git\n", []string{"git@github.com:a/b.git"}},
+		{"same line then next line", "[remote \"origin\"] url = a\n\turl = b\n", []string{"a", "b"}},
+		{"two sections", "[remote \"origin\"] url = a\n[remote \"up\"] url = b\n", []string{"a", "b"}},
+		{"same line comment only", "[remote \"x\"] # c\n\turl = d\n", []string{"d"}},
+		{"same line trailing comment", "[remote \"x\"] url = e ; c\n", []string{"e"}},
+		{"non-remote same line ignored", "[core] url = nope\n[remote \"x\"] url = f\n", []string{"f"}},
+		{"dotted section same line", "[remote.origin] url = g\n", []string{"g"}},
+		{"same line non-url key", "[remote \"x\"] fetch = +refs/*\n\turl = h\n", []string{"h"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := parseGitConfigRemotes(tt.in); !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("got %v want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDetect_NoGitBinary_SameLineRemoteURL(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, ".git", "config"),
+		"[core]\n\trepositoryformatversion = 0\n[remote \"origin\"] url = git@github.com:acme/widgets.git\n")
+	got, err := Detect(context.Background(), dir, failingRunner(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFps(t, got, []string{"git:github.com/acme/widgets", "dir:" + filepath.Base(dir)})
+}
+
+// Package.swift: ".target(name:)" hoisted above the Package(...) initialiser
+// must not be mistaken for the package name.
+func TestDetect_PackageSwiftHoistedTargets(t *testing.T) {
+	src := `// swift-tools-version:5.9
+import PackageDescription
+
+let targets: [Target] = [
+    .target(name: "Core"),
+    .testTarget(name: "CoreTests", dependencies: ["Core"]),
+]
+
+let package = Package(
+    name: "MyLibrary",
+    targets: targets
+)
+`
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "Package.swift"), src)
+	got, err := Detect(context.Background(), dir, failingRunner(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFps(t, got, []string{"swift:MyLibrary", "dir:" + filepath.Base(dir)})
+
+	// Products/targets declared inline after the name keep working, and a file
+	// with no Package(...) call still yields nothing.
+	for _, tc := range []struct{ src, want string }{
+		{"let package = Package(\n    name: \"Inline\",\n    products: [.library(name: \"Other\", targets: [\"Inline\"])]\n)\n", "swift:Inline"},
+		{"import PackageDescription\nlet x = 1\n", ""},
+	} {
+		d := t.TempDir()
+		writeFile(t, filepath.Join(d, "Package.swift"), tc.src)
+		fps, err := Detect(context.Background(), d, failingRunner(nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []string{"dir:" + filepath.Base(d)}
+		if tc.want != "" {
+			want = append([]string{tc.want}, want...)
+		}
+		assertFps(t, fps, want)
+	}
+}

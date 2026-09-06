@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/sanbiv/private-sync/internal/sync"
 )
@@ -231,5 +232,40 @@ func TestSyncViewResolverResolveGoesToApply(t *testing.T) {
 	}
 	if _, ok := next.res[it.Key]; !ok {
 		t.Fatalf("resolving the item should have recorded a resolution before handing off")
+	}
+}
+
+// TestSyncViewSpinnerTickSurvivesResolveStage is the regression for the
+// spinner's tick chain dying at the conflict resolver: stageResolve routed
+// every message (spinner.TickMsg included) to the Resolver, which drops it,
+// and nothing ever re-armed the chain — so the apply and push spinner stayed
+// frozen on one frame for the whole write-heavy part of the run.
+func TestSyncViewSpinnerTickSurvivesResolveStage(t *testing.T) {
+	m := newTestSyncView()
+	m.plan = planWith(textConflictItem())
+	m.stage = stageResolve
+	m.resolver = NewResolver(m.plan, m.res)
+
+	frameBefore := m.spin.View()
+	next, cmd := m.Update(spinner.TickMsg{})
+	m = next
+	if cmd == nil {
+		t.Fatalf("a spinner tick during stageResolve must re-arm the tick chain")
+	}
+	if m.spin.View() == frameBefore {
+		t.Fatalf("the spinner should have advanced a frame during stageResolve")
+	}
+	if m.stage != stageResolve || m.resolver == nil {
+		t.Fatalf("handling the tick must not disturb the resolve stage (stage=%v)", m.stage)
+	}
+
+	// The chain is still alive once the resolver hands off to apply.
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'l'}})
+	m = next
+	if m.stage != stageApply {
+		t.Fatalf("stage = %v, want stageApply after the last conflict is answered", m.stage)
+	}
+	if _, cmd := m.Update(spinner.TickMsg{}); cmd == nil {
+		t.Fatalf("the spinner must keep ticking during stageApply")
 	}
 }

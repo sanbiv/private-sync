@@ -10,11 +10,29 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 
 	"github.com/sanbiv/private-sync/internal/execx"
+	"github.com/sanbiv/private-sync/internal/fsutil"
 )
+
+// gitDirName is the VCS metadata directory, always skipped by the walk.
+const gitDirName = ".git"
+
+// mergeSuffix names the scratch file the conflict resolver writes next to a
+// conflicted file ("<file>.psv-merge"). It holds the plaintext of both sides
+// and its cleanup is best-effort, so a leftover must never be offered for
+// tracking. fsutil.TempPrefix covers the atomic-write temps the same way.
+const mergeSuffix = ".psv-merge"
+
+// isScratchName reports whether name is one of private-sync's own scratch
+// files (an atomic-write temp or a conflict merge file).
+func isScratchName(name string) bool {
+	base := filepath.Base(name)
+	return fsutil.IsTemp(base) || strings.HasSuffix(base, mergeSuffix)
+}
 
 // Score drives pre-selection in the UI.
 type Score int
@@ -166,6 +184,13 @@ func Scan(ctx context.Context, dir string, opts Options, r execx.Runner) (*Resul
 		}
 		name := d.Name()
 		if d.IsDir() {
+			// VCS metadata is never a candidate source. A non-empty
+			// scan.exclude_dirs replaces the defaults (spec §3), so relying on
+			// DefaultExcludeDirs() to carry ".git" would let a custom list walk
+			// the repo's own object store (spec §14).
+			if name == gitDirName {
+				return fs.SkipDir
+			}
 			if excludeDirSet[strings.ToLower(name)] {
 				return fs.SkipDir
 			}
@@ -196,6 +221,15 @@ func Scan(ctx context.Context, dir string, opts Options, r execx.Runner) (*Resul
 			return nil
 		}
 		if MatchesAny(name, excludeFiles) {
+			return nil
+		}
+		// private-sync's own scratch files hold plaintext copies of tracked
+		// secrets (the conflict resolver's ".psv-merge" and the atomic-write
+		// temps). They match include globs such as ".env.*" and score as
+		// secrets, so they are skipped unconditionally: a user-supplied
+		// scan.exclude_files replaces the defaults and could otherwise drop
+		// them.
+		if isScratchName(name) {
 			return nil
 		}
 		matched, pattern := matchInclude(name, include)
@@ -378,6 +412,22 @@ func appendVaultTracked(root string, cands []Candidate, tracked map[string]bool,
 			*warnings = append(*warnings, fmt.Sprintf("tracked file %s is not a regular file", rel))
 			continue
 		}
+		// Lstat only guards the final component: an intermediate symlinked
+		// directory is resolved by the OS and would expose a file outside the
+		// project, which the walk itself never follows. root is already
+		// symlink-resolved by resolveDir.
+		real, err := filepath.EvalSymlinks(p)
+		if err != nil {
+			*warnings = append(*warnings, fmt.Sprintf("tracked file %s: %v", rel, err))
+			continue
+		}
+		if isHardExcluded(real, hard) {
+			continue
+		}
+		if !isWithinDir(root, real) {
+			*warnings = append(*warnings, fmt.Sprintf("tracked file %s resolves outside the project", rel))
+			continue
+		}
 		c := Candidate{
 			Path:       rel,
 			Size:       info.Size(),
@@ -418,8 +468,25 @@ func resolveDir(dir string) (string, error) {
 	return real, nil
 }
 
+// caseInsensitivePaths mirrors config.caseInsensitivePaths: on macOS and
+// Windows the default filesystems ignore case, so path containment checks must
+// fold case or the key file could be listed under a differently-cased project
+// root. A case-sensitive volume on those platforms gets a false positive at
+// worst, which is the safer failure for a check guarding the passphrase file.
+var caseInsensitivePaths = runtime.GOOS == "darwin" || runtime.GOOS == "windows"
+
+// foldPath lowercases p on case-insensitive platforms.
+func foldPath(p string) string {
+	if caseInsensitivePaths {
+		return strings.ToLower(p)
+	}
+	return p
+}
+
 // normalizeHardExcludes returns cleaned absolute (symlink-resolved when
-// possible) versions of the given paths, dropping empty entries.
+// possible) versions of the given paths, dropping empty entries. Entries are
+// case-folded on case-insensitive platforms so they still match a root spelled
+// with different casing.
 func normalizeHardExcludes(in []string) []string {
 	var out []string
 	for _, h := range in {
@@ -431,16 +498,18 @@ func normalizeHardExcludes(in []string) []string {
 			continue
 		}
 		abs = filepath.Clean(abs)
-		out = append(out, abs)
+		out = append(out, foldPath(abs))
 		if real, err := filepath.EvalSymlinks(abs); err == nil && real != abs {
-			out = append(out, real)
+			out = append(out, foldPath(real))
 		}
 	}
 	return out
 }
 
-// isHardExcluded reports whether p equals or lies below any hard exclude.
+// isHardExcluded reports whether p equals or lies below any hard exclude. The
+// hard excludes are already folded by normalizeHardExcludes.
 func isHardExcluded(p string, hard []string) bool {
+	p = foldPath(p)
 	for _, h := range hard {
 		if p == h {
 			return true
@@ -450,6 +519,13 @@ func isHardExcluded(p string, hard []string) bool {
 		}
 	}
 	return false
+}
+
+// isWithinDir reports whether p equals dir or lies below it (both absolute and
+// cleaned), folding case on case-insensitive platforms.
+func isWithinDir(dir, p string) bool {
+	dir, p = foldPath(filepath.Clean(dir)), foldPath(filepath.Clean(p))
+	return p == dir || strings.HasPrefix(p, dir+string(filepath.Separator))
 }
 
 // hasGitEntry reports whether dir contains a ".git" entry (dir or file).
@@ -586,6 +662,7 @@ func DefaultExcludeFiles() []string {
 		"Cargo.lock", "go.sum", "*.min.json", "tsconfig*.json", "*.schema.json", ".eslintrc*",
 		".prettierrc*", "renovate.json", "lerna.json", "jsconfig.json", "package.json",
 		"composer.json", "manifest.json", "*.lock.json",
+		"*" + mergeSuffix, "*" + fsutil.TempPrefix + "*",
 	}
 }
 

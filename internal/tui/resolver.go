@@ -12,6 +12,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/sanbiv/private-sync/internal/app"
+	"github.com/sanbiv/private-sync/internal/execx"
 	"github.com/sanbiv/private-sync/internal/merge"
 	"github.com/sanbiv/private-sync/internal/sync"
 )
@@ -41,6 +42,14 @@ type Resolver struct {
 	dotenv *dotenvState
 
 	editing bool
+
+	// pendingEditKey/pendingEditPath remember the .psv-merge scratch file of
+	// the item currently being edited in $EDITOR. It survives an edit that
+	// came back with conflict markers still in it, so pressing e again
+	// reopens the half-merged file instead of overwriting the user's work
+	// with freshly rendered markers.
+	pendingEditKey  sync.ItemKey
+	pendingEditPath string
 }
 
 // dotenvChoice tracks the user's answer for one dotenv hunk (spec §8, §2.2 "k").
@@ -206,6 +215,9 @@ func (m *Resolver) finishCmd() tea.Cmd {
 // advance moves to the next item that still lacks a resolution (L/R can
 // resolve several at once) and reports done when none remain.
 func (m *Resolver) advance() tea.Cmd {
+	// Leaving the item drops whatever half-merged scratch file it still had:
+	// it is only meaningful for the item it belongs to.
+	m.discardPendingEdit()
 	m.idx++
 	for m.idx < len(m.items) {
 		if _, ok := m.res[m.items[m.idx].Key]; ok {
@@ -235,6 +247,51 @@ func (m *Resolver) singleStrategy(it *sync.Item, s sync.Strategy) bool {
 	return ok
 }
 
+// advanceAfterStrategy moves on only when the bulk strategy (L/R) actually
+// decided the item on screen. sync.ApplyStrategy declines some items on
+// purpose (StrategyLocal with no local copy, StrategyRemote on an ambiguous
+// concurrent head), and advance() starts with idx++ and afterwards only skips
+// items that already have a resolution — so without this check one press of
+// L/R would step straight over the undecidable item on screen and never show
+// it again, leaving it silently unresolved. The single-key "l"/"r" paths have
+// always reported this instead of skipping; L/R now behave the same.
+func (m *Resolver) advanceAfterStrategy(refusal string) tea.Cmd {
+	if it := m.currentItem(); it != nil {
+		if _, ok := m.res[it.Key]; !ok {
+			m.msg = refusal
+			return nil
+		}
+	}
+	return m.advance()
+}
+
+// forgetPendingEdit drops the reference to the scratch merge file without
+// touching the file itself (the caller has already removed or consumed it).
+func (m *Resolver) forgetPendingEdit() {
+	m.pendingEditKey = sync.ItemKey{}
+	m.pendingEditPath = ""
+}
+
+// discardPendingEdit removes a scratch merge file kept for a later `e`, so it
+// never outlives the item it belongs to.
+func (m *Resolver) discardPendingEdit() {
+	if m.pendingEditPath == "" {
+		return
+	}
+	os.Remove(m.pendingEditPath)
+	m.forgetPendingEdit()
+}
+
+// resumableEdit reports whether a scratch merge file kept from an earlier,
+// still-conflicted edit of key is available at path.
+func (m *Resolver) resumableEdit(key sync.ItemKey, path string) bool {
+	if m.pendingEditPath != path || m.pendingEditKey != key {
+		return false
+	}
+	_, err := os.Stat(path)
+	return err == nil
+}
+
 // Update satisfies tea.Model.
 func (m *Resolver) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
@@ -253,6 +310,7 @@ func (m *Resolver) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// enclosing rootModel.Update returns before dispatching to it — so the
 	// standalone guard here cannot double-handle that case.
 	if k, ok := msg.(tea.KeyMsg); ok && k.String() == "ctrl+c" && m.standalone {
+		m.discardPendingEdit()
 		m.aborted = true
 		m.done = true
 		return m, tea.Quit
@@ -280,6 +338,7 @@ func (m *Resolver) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	switch key.String() {
 	case "A":
+		m.discardPendingEdit()
 		m.aborted = true
 		m.done = true
 		return m, m.finishCmd()
@@ -288,10 +347,10 @@ func (m *Resolver) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.advance()
 	case "L":
 		sync.ApplyStrategy(m.plan, sync.StrategyLocal, m.res)
-		return m, m.advance()
+		return m, m.advanceAfterStrategy("no local copy to keep — choose r, e or s for this file")
 	case "R":
 		sync.ApplyStrategy(m.plan, sync.StrategyRemote, m.res)
-		return m, m.advance()
+		return m, m.advanceAfterStrategy("no single remote version to take — choose l, e or s for this file")
 	case "c", "enter":
 		if it.Action == sync.ActionDeleteRemote {
 			m.res[it.Key] = sync.Resolution{Kind: sync.ChooseConfirm}
@@ -418,11 +477,17 @@ func (m *Resolver) startEdit(it *sync.Item) (tea.Model, tea.Cmd) {
 	}
 	full := filepath.Join(pp.Path, filepath.FromSlash(it.Key.Path))
 	mergePath := full + mergeTempSuffix
-	data := merge.RenderMarkers(it.Merge, "local", remoteLabelFor(it))
-	if err := os.WriteFile(mergePath, data, 0o600); err != nil {
-		m.msg = fmt.Sprintf("write merge file: %v", err)
-		return m, nil
+	// An earlier edit of this same item that came back with markers still in
+	// it keeps its scratch file: reopen that, so the hunks the user already
+	// merged by hand survive. Only a first edit renders pristine markers.
+	if !m.resumableEdit(it.Key, mergePath) {
+		data := merge.RenderMarkers(it.Merge, "local", remoteLabelFor(it))
+		if err := os.WriteFile(mergePath, data, 0o600); err != nil {
+			m.msg = fmt.Sprintf("write merge file: %v", err)
+			return m, nil
+		}
 	}
+	m.pendingEditKey, m.pendingEditPath = it.Key, mergePath
 	m.editing = true
 	key := it.Key
 	cmd := editorCommand(editor, mergePath)
@@ -438,29 +503,45 @@ func (m *Resolver) startEdit(it *sync.Item) (tea.Model, tea.Cmd) {
 // "executable file not found" instead of running the intended editor.
 // editor must already be non-blank (checked by the caller), so Fields always
 // yields at least one element.
+// The editor is also given a sanitised environment: $EDITOR (and everything
+// it spawns — plugins, LSP servers, format-on-save hooks) must not inherit
+// the secrets execx.Denylist names (BW_SESSION, BW_PASSWORD, ...), or a
+// plugin could read $BW_SESSION and decrypt the user's whole Bitwarden vault.
+// This mirrors the CLI's `config edit` (cli.editConfig).
 func editorCommand(editor, mergePath string) *exec.Cmd {
 	parts := strings.Fields(editor)
 	args := append(append([]string(nil), parts[1:]...), mergePath)
-	return exec.Command(parts[0], args...)
+	cmd := exec.Command(parts[0], args...)
+	cmd.Env = execx.SanitizedEnv(nil)
+	return cmd
 }
 
 func (m *Resolver) handleEditDone(msg editDoneMsg) (tea.Model, tea.Cmd) {
 	m.editing = false
 	if msg.err != nil {
 		os.Remove(msg.path)
+		m.forgetPendingEdit()
 		m.msg = fmt.Sprintf("editor failed: %v", msg.err)
 		return m, nil
 	}
 	content, err := os.ReadFile(msg.path)
-	os.Remove(msg.path)
 	if err != nil {
+		os.Remove(msg.path)
+		m.forgetPendingEdit()
 		m.msg = fmt.Sprintf("read merge file: %v", err)
 		return m, nil
 	}
 	if merge.HasMarkers(content) {
+		// Refuse the edit (spec §2.2 item 5) but keep the scratch file: it
+		// holds every hunk the user has already merged by hand, and startEdit
+		// reopens it on the next `e`. Deleting it here threw that work away
+		// and restarted from pristine markers. advance()/abort remove it.
+		m.pendingEditKey, m.pendingEditPath = msg.key, msg.path
 		m.msg = "still contains conflict markers; resolve them and press e again"
 		return m, nil
 	}
+	os.Remove(msg.path)
+	m.forgetPendingEdit()
 	m.res[msg.key] = sync.Resolution{Kind: sync.ChooseCustom, Content: content}
 	return m, m.advance()
 }

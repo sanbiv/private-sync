@@ -78,8 +78,36 @@ func isSpace(c byte) bool {
 	return c == ' ' || c == '\t' || c == '\r' || c == '\v' || c == '\f'
 }
 
-// normalise drops '\r', strips trailing whitespace per line, collapses runs
-// of leading whitespace to one space and ignores the final newline.
+// normTabWidth is the tab stop used when normalising leading whitespace, so
+// that a tab and the equivalent run of spaces compare equal while indentation
+// *depth* is still preserved.
+const normTabWidth = 4
+
+// leadingWidth returns the visual column reached by the leading whitespace run
+// l[:n]: tabs advance to the next multiple of normTabWidth, '\r' contributes
+// nothing (normalise drops carriage returns) and every other whitespace byte
+// counts as one column.
+func leadingWidth(l []byte, n int) int {
+	w := 0
+	for _, c := range l[:n] {
+		switch c {
+		case '\t':
+			w += normTabWidth - w%normTabWidth
+		case '\r':
+			// dropped
+		default:
+			w++
+		}
+	}
+	return w
+}
+
+// normalise drops '\r', strips trailing whitespace per line, rewrites each
+// line's leading whitespace run as its visual width in spaces (tabs expanded)
+// and ignores the final newline. Indentation *width* is significant — in
+// whitespace-sensitive formats such as YAML, re-nesting a key is a semantic
+// change — so only the spelling of an indent is normalised away, never its
+// depth.
 func normalise(b []byte) []byte {
 	out := make([]byte, 0, len(b))
 	ls := newLineSet(b)
@@ -96,7 +124,7 @@ func normalise(b []byte) []byte {
 		for i < len(l) && isSpace(l[i]) {
 			i++
 		}
-		if i > 0 {
+		for w := leadingWidth(l, i); w > 0; w-- {
 			out = append(out, ' ')
 		}
 		for _, c := range l[i:] {

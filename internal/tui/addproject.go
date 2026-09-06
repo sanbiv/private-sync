@@ -447,6 +447,13 @@ func (m *addModel) updateIdentify(msg tea.Msg) (bool, tea.Cmd) {
 	if msgv.gen != m.identGen {
 		return false, nil // stale: from an identify esc already cancelled
 	}
+	// The identify (success or failure) is over: release the child context
+	// enterCmd derived from m.ctx now rather than only on esc, or it leaks
+	// its parent-context registration for the rest of the program's life
+	// (the fetch and scan handlers do the same on every path).
+	if m.identCancel != nil {
+		m.identCancel()
+	}
 	if msgv.err != nil {
 		m.err = msgv.err.Error()
 		return false, nil

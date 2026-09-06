@@ -15,9 +15,13 @@ func TestNormalise(t *testing.T) {
 		{"a\n", "a\n"},
 		{"a\r\n", "a\n"},
 		{"a  \t\n", "a\n"},
-		{"\tx\n", " x\n"},
-		{"    x\n", " x\n"},
-		{" \t x  \r\n", " x\n"},
+		// Indentation width is preserved (tabs expanded to 4-column stops);
+		// only the *spelling* of an indent is normalised away.
+		{"\tx\n", "    x\n"},
+		{"    x\n", "    x\n"},
+		{"  x\n", "  x\n"},
+		{"\t\tx\n", "        x\n"},
+		{" \t x  \r\n", "     x\n"},
 		{"a\n\n", "a\n\n"},
 		{"   \n", "\n"},
 		{"a\rb\n", "ab\n"},
@@ -26,6 +30,52 @@ func TestNormalise(t *testing.T) {
 		if got := string(normalise([]byte(tc.in))); got != tc.want {
 			t.Errorf("normalise(%q) = %q, want %q", tc.in, got, tc.want)
 		}
+	}
+}
+
+// Regression: normalise used to collapse every leading-whitespace run to a
+// single space, so lines at *any* depth compared equal. In YAML (the first
+// entry of the default include list) re-nesting a key is purely a leading
+// whitespace change, so the whole-file short-circuit classified it as
+// formatting-only and silently returned the other side verbatim as a clean
+// merge, losing the re-nesting without ever showing a conflict.
+func TestNormaliseKeepsIndentDepth(t *testing.T) {
+	base := []byte("server:\n  tls:\n    enabled: true\n  port: 80\n")
+	// local re-nests `port` under `tls`; remote flips `enabled`.
+	local := []byte("server:\n  tls:\n    enabled: true\n    port: 80\n")
+	remote := []byte("server:\n  tls:\n    enabled: false\n  port: 80\n")
+
+	if bytes.Equal(normalise(local), normalise(base)) {
+		t.Fatalf("re-nesting must not normalise to base: %q", normalise(local))
+	}
+	r := ThreeWay("config.yaml", base, local, remote)
+	if r.Clean {
+		t.Fatalf("re-nesting vs value edit: got clean merge %q (note %q), want conflict",
+			r.Merged, r.Note)
+	}
+	if r.Note != "" {
+		t.Errorf("Note = %q, want empty", r.Note)
+	}
+	if len(r.Hunks) != 1 {
+		t.Fatalf("len(Hunks) = %d, want 1", len(r.Hunks))
+	}
+	h := r.Hunks[0]
+	if string(h.Local) != "    enabled: true\n    port: 80\n" ||
+		string(h.Remote) != "    enabled: false\n  port: 80\n" {
+		t.Errorf("hunk = %+v, want the re-indented/edited lines", h)
+	}
+
+	// A one-sided deepening with an untouched other side still applies, and
+	// re-spelling an indent (tab vs the equivalent spaces) at the same depth
+	// is still formatting-only.
+	if r := ThreeWay("config.yaml", base, local, base); !r.Clean || !bytes.Equal(r.Merged, local) {
+		t.Errorf("remote untouched: clean=%v merged=%q, want clean local", r.Clean, r.Merged)
+	}
+	tabbed := []byte("server:\n\ttls:\n\t\tenabled: true\n")
+	spaced := []byte("server:\n    tls:\n        enabled: true\n")
+	if !bytes.Equal(normalise(tabbed), normalise(spaced)) {
+		t.Errorf("tab/space respelling at equal depth must normalise the same: %q vs %q",
+			normalise(tabbed), normalise(spaced))
 	}
 }
 

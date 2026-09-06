@@ -1,6 +1,7 @@
 package state
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -327,5 +328,97 @@ func TestTrashPutCorruptIndexWritesNoBlob(t *testing.T) {
 	})
 	if len(blobs) != 0 {
 		t.Errorf("orphan blob written despite index failure: %v", blobs)
+	}
+}
+
+// --- TrashPut never dedupes against a file that is not the ciphertext -------
+
+// TestTrashPutReplacesUnusableBlob tampers with the blob path a TrashPut is
+// about to use — the cases an external restore or file-sync client can leave
+// behind — and requires that the put never reports success while the stored
+// bytes are unusable. The trash is the only copy of a pre-image the engine is
+// about to overwrite, so a skipped write that still returns an entry loses the
+// secret for good.
+func TestTrashPutReplacesUnusableBlob(t *testing.T) {
+	k := testKeys(t)
+	content := []byte("the only copy of this secret\n")
+	blob, ciphertext, err := k.SealBlob(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tamper := map[string]func(t *testing.T, path string){
+		"empty file": func(t *testing.T, path string) {
+			if err := os.WriteFile(path, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"truncated ciphertext": func(t *testing.T, path string) {
+			if err := os.WriteFile(path, ciphertext[:len(ciphertext)/2], 0o600); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"same size, different bytes": func(t *testing.T, path string) {
+			junk := make([]byte, len(ciphertext))
+			copy(junk, ciphertext)
+			junk[len(junk)-1] ^= 0xff
+			if err := os.WriteFile(path, junk, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"dangling symlink": func(t *testing.T, path string) {
+			if err := os.Symlink(filepath.Join(filepath.Dir(path), "gone.enc"), path); err != nil {
+				t.Skipf("symlinks unavailable: %v", err)
+			}
+		},
+		"directory": func(t *testing.T, path string) {
+			if err := os.Mkdir(path, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		},
+	}
+
+	for name, tamperWith := range tamper {
+		t.Run(name, func(t *testing.T) {
+			s, err := Open(t.TempDir(), "v")
+			if err != nil {
+				t.Fatal(err)
+			}
+			blobPath, err := s.trashBlobPath(blob)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(filepath.Dir(blobPath), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			tamperWith(t, blobPath)
+
+			entry, err := s.TrashPut(k, "p", "secrets/.env", content, 0o600)
+			if err != nil {
+				// Refusing the put is acceptable: the caller keeps the
+				// pre-image. Silently indexing unusable bytes is not.
+				if l, lerr := s.TrashList(); lerr != nil || len(l) != 0 {
+					t.Fatalf("TrashPut failed (%v) but left %d index rows (%v)", err, len(l), lerr)
+				}
+				return
+			}
+			if entry.Blob != blob {
+				t.Fatalf("blob id = %q, want %q", entry.Blob, blob)
+			}
+			got, _, err := s.TrashRead(k, entry.ID)
+			if err != nil {
+				t.Fatalf("TrashRead after successful TrashPut: %v", err)
+			}
+			if !bytes.Equal(got, content) {
+				t.Fatalf("TrashRead = %q, want %q", got, content)
+			}
+			st, err := os.Lstat(blobPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !st.Mode().IsRegular() {
+				t.Errorf("blob path is %v, want a regular file", st.Mode())
+			}
+		})
 	}
 }

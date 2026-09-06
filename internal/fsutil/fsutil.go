@@ -12,7 +12,9 @@ import (
 )
 
 // TempPrefix is the marker used for in-flight temporary files. Every temp file
-// is named "<target>.psv-tmp-<suffix>" and lives in the target's directory.
+// is named "<target>.psv-tmp-<suffix>-<unique>" and lives in the target's
+// directory: the suffix identifies the writer, the trailing unique part keeps
+// two writes of the same target on the same machine apart.
 const TempPrefix = ".psv-tmp-"
 
 // EnsureDir creates dir with mode 0700 (parents included) when missing.
@@ -20,7 +22,9 @@ func EnsureDir(dir string) error { return os.MkdirAll(dir, 0o700) }
 
 // WriteFileAtomic writes data to path via a same-directory temp file, fsyncs it
 // and renames it over the target. suffix identifies the writer (e.g. the first 8
-// chars of the machine id) so concurrent writers on a shared folder never collide.
+// chars of the machine id); the temp name additionally carries a unique tail, so
+// no two writes ever share a temp file — not across machines, not across
+// processes on one machine, and not across goroutines in one process.
 func WriteFileAtomic(path string, data []byte, mode fs.FileMode, suffix string) (err error) {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -29,11 +33,11 @@ func WriteFileAtomic(path string, data []byte, mode fs.FileMode, suffix string) 
 	if suffix == "" {
 		suffix = "w"
 	}
-	tmp := path + TempPrefix + suffix
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
+	f, err := createTemp(dir, filepath.Base(path), suffix)
 	if err != nil {
 		return err
 	}
+	tmp := f.Name()
 	defer func() {
 		if err != nil {
 			_ = os.Remove(tmp)
@@ -65,6 +69,14 @@ func WriteFileAtomic(path string, data []byte, mode fs.FileMode, suffix string) 
 	return nil
 }
 
+// createTemp opens a fresh temp file for base in dir, named
+// "<base>.psv-tmp-<suffix>-<unique>". os.CreateTemp picks the unique tail and
+// creates the file exclusively, so two writers — two goroutines, two processes
+// on one machine, or two machines — are never handed the same temp file.
+func createTemp(dir, base, suffix string) (*os.File, error) {
+	return os.CreateTemp(dir, base+TempPrefix+suffix+"-*")
+}
+
 func renameRetry(from, to string) error {
 	var err error
 	for i := 0; i < 10; i++ {
@@ -77,8 +89,25 @@ func renameRetry(from, to string) error {
 	return err
 }
 
+// hasTempSuffix reports whether name is a temp file whose writer suffix is
+// exactly the one in marker (TempPrefix+suffix): either the bare
+// "<target>.psv-tmp-<suffix>" or "<target>.psv-tmp-<suffix>-<unique>" written by
+// WriteFileAtomic. A longer writer suffix that merely starts with this one
+// ("…-tmp-abc1" for marker "…-tmp-abc") does not match.
+func hasTempSuffix(name, marker string) bool {
+	i := strings.LastIndex(name, marker)
+	if i < 0 {
+		return false
+	}
+	rest := name[i+len(marker):]
+	return rest == "" || rest[0] == '-'
+}
+
 // CleanupTemp removes leftover temp files with the given suffix below root.
 func CleanupTemp(root, suffix string) error {
+	if suffix == "" {
+		suffix = "w" // what WriteFileAtomic substitutes for an empty suffix
+	}
 	marker := TempPrefix + suffix
 	return filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -93,7 +122,7 @@ func CleanupTemp(root, suffix string) error {
 			}
 			return nil
 		}
-		if strings.HasSuffix(d.Name(), marker) {
+		if hasTempSuffix(d.Name(), marker) {
 			_ = os.Remove(p)
 		}
 		return nil

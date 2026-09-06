@@ -1035,6 +1035,13 @@ func (v *Vault) WriteBlob(plaintext []byte) (id string, created bool, err error)
 	lock.Lock()
 	defer lock.Unlock()
 	if v.sameBlobOnDisk(file, ct) {
+		// Recorded even though this call created nothing: Written() is the only
+		// list the transport pushes blobs from (spec §10), so a blob left on
+		// disk by an interrupted earlier run must still be named here. Without
+		// it the journal published in this run would reference a blob the
+		// remote never receives, and every other machine would see that path
+		// as pending forever.
+		v.record(rel)
 		return id, false, nil
 	}
 	if err := fsutil.WriteFileAtomic(file, ct, 0o600, v.tempSuffix()); err != nil {
@@ -1180,9 +1187,9 @@ func checkRelPath(rel string, bad error) error {
 }
 
 // checkEntry validates one journal entry against its map key: a known kind,
-// a well-formed path, and a Path field that (when set) matches the key.
-// Shared by readJournal and WriteJournal so a machine never writes what
-// every other machine would refuse.
+// a well-formed path, a Path field that (when set) matches the key, and a
+// Blob that agrees with the kind. Shared by readJournal and WriteJournal so
+// a machine never writes what every other machine would refuse.
 func checkEntry(p string, e Entry) error {
 	if !e.Kind.Valid() {
 		return fmt.Errorf("entry %q has unknown kind %d", p, e.Kind)
@@ -1192,6 +1199,17 @@ func checkEntry(p string, e Entry) error {
 	}
 	if e.Path != "" && e.Path != p {
 		return fmt.Errorf("entry %q: %w: path field is %q", p, ErrBadEntryPath, e.Path)
+	}
+	// Blob and Kind must agree, with the same defence-in-depth as an unknown
+	// kind. A live file with no blob is not "an empty file": head resolution
+	// would hand it to the sync engine as content, which truncates the local
+	// file (spec §5 gives every KindFile head a blob), and a tombstone that
+	// names a blob claims content it must not have.
+	if e.Kind == KindFile && e.Blob == "" {
+		return fmt.Errorf("entry %q of kind %s has no blob", p, e.Kind)
+	}
+	if e.Kind != KindFile && e.Blob != "" {
+		return fmt.Errorf("entry %q of kind %s has blob %q", p, e.Kind, e.Blob)
 	}
 	return nil
 }

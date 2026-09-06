@@ -130,7 +130,7 @@ func TestCheckEntry(t *testing.T) {
 		e    Entry
 		want error
 	}{
-		{"ok", "a/b", Entry{Path: "a/b", Kind: KindFile}, nil},
+		{"ok", "a/b", Entry{Path: "a/b", Kind: KindFile, Blob: "ab"}, nil},
 		{"ok empty path", "a/b", Entry{Kind: KindDeleted}, nil},
 		{"unknown kind", "a", Entry{Kind: Kind(5)}, nil}, // an error, but not ErrBadEntryPath
 		{"mismatch", "a", Entry{Path: "b", Kind: KindFile}, ErrBadEntryPath},

@@ -47,17 +47,24 @@ func (c *cli) statusCommand() *cobra.Command {
 	return cmd
 }
 
-// printStatus renders a plan without applying it.
+// printStatus renders a plan without applying it. An unreadable project is
+// reported and fails the command: its files are not being synchronised.
 func (c *cli) printStatus(p *sync.Plan) error {
 	if c.g.json {
-		return c.printJSON(struct {
+		if err := c.printJSON(struct {
 			Projects []projectView `json:"projects"`
 			Warnings []string      `json:"warnings,omitempty"`
-		}{Projects: projectViews(p, nil, nil), Warnings: p.Warnings})
+		}{Projects: projectViews(p, nil, nil), Warnings: p.Warnings}); err != nil {
+			return err
+		}
+		if n := unreadableProjects(p); n > 0 {
+			return fmt.Errorf("%d project(s) could not be read: %s", n, unreadableHint)
+		}
+		return nil
 	}
 	for pi := range p.Projects {
 		pp := &p.Projects[pi]
-		fmt.Fprintln(c.out, c.projectHeader(pp)+"  "+c.paint(colorDim, summaryText(sync.Summarize(pp))))
+		fmt.Fprintln(c.out, c.projectHeader(pp)+"  "+c.paint(colorDim, summaryText(summarize(pp))))
 		for i := range pp.Items {
 			it := &pp.Items[i]
 			fmt.Fprintln(c.out, "  "+c.statusLine(it))
@@ -71,6 +78,9 @@ func (c *cli) printStatus(p *sync.Plan) error {
 	}
 	for _, w := range p.Warnings {
 		c.warn(w)
+	}
+	if n := unreadableProjects(p); n > 0 {
+		return fmt.Errorf("%d project(s) could not be read: %s", n, unreadableHint)
 	}
 	return nil
 }
@@ -182,10 +192,37 @@ func (c *cli) syncWith(ctx context.Context, s *app.Session, opts sync.Options, r
 	if pushErr != nil {
 		return pushErr
 	}
+	// Per item failures are printed by the report but must also fail the
+	// command: a cron or CI wrapper only sees the exit code.
+	if rep != nil && len(rep.Errors) > 0 {
+		return fmt.Errorf("%d item(s) failed", len(rep.Errors))
+	}
+	if n := unreadableProjects(plan); n > 0 {
+		return fmt.Errorf("%d project(s) could not be read: %s", n, unreadableHint)
+	}
 	if n := len(unresolvedKeys(plan, res, rep)); n > 0 {
 		return fmt.Errorf("%w: %d (run again in a terminal, or pass --strategy local|remote)", errUnresolved, n)
 	}
 	return nil
+}
+
+// unreadableHint explains what an undecryptable journal means.
+const unreadableHint = "their journal could not be decrypted, so nothing was planned for them (restore the vault copy, or run `private-sync status` for the file names)"
+
+// unreadableProjects counts the projects whose journal could not be decrypted.
+// Plan drops all their items (spec §5: the plan is aborted for that project),
+// so an empty report for them means "not synchronised", never "up to date".
+func unreadableProjects(p *sync.Plan) int {
+	if p == nil {
+		return 0
+	}
+	n := 0
+	for i := range p.Projects {
+		if p.Projects[i].Unreadable {
+			n++
+		}
+	}
+	return n
 }
 
 // restoreCommand: vault head → local for every tracked file of a project.

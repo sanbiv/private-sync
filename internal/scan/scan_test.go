@@ -222,8 +222,8 @@ func TestDefaults(t *testing.T) {
 	if n := len(DefaultExcludeDirs()); n != 36 {
 		t.Errorf("DefaultExcludeDirs has %d entries, want 36", n)
 	}
-	if n := len(DefaultExcludeFiles()); n != 18 {
-		t.Errorf("DefaultExcludeFiles has %d entries, want 18", n)
+	if n := len(DefaultExcludeFiles()); n != 20 {
+		t.Errorf("DefaultExcludeFiles has %d entries, want 20", n)
 	}
 	for _, want := range []string{".env", "*.yaml", "wp-config.php", "*.env.ts", "*.local.*"} {
 		if !contains(DefaultInclude(), want) {
@@ -235,7 +235,7 @@ func TestDefaults(t *testing.T) {
 			t.Errorf("DefaultExcludeDirs missing %q", want)
 		}
 	}
-	for _, want := range []string{"package.json", "*.lock.json", "go.sum"} {
+	for _, want := range []string{"package.json", "*.lock.json", "go.sum", "*.psv-merge", "*.psv-tmp-*"} {
 		if !contains(DefaultExcludeFiles(), want) {
 			t.Errorf("DefaultExcludeFiles missing %q", want)
 		}
@@ -1165,5 +1165,133 @@ func TestScanRealGit(t *testing.T) {
 	env, _ := find(out.Candidates, ".env")
 	if env.Score != ScoreHigh {
 		t.Errorf("no-git .env = %v, want High", env.Score)
+	}
+}
+
+// A non-empty scan.exclude_dirs replaces the defaults (spec §3), so the walk
+// must skip ".git" on its own instead of relying on DefaultExcludeDirs().
+func TestScanAlwaysSkipsGitDir(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, ".git/objects/aa/bb.json", []byte("{}"))
+	writeFile(t, root, ".git/secret-stuff", []byte("x"))
+	writeFile(t, root, ".git/config", []byte("[core]"))
+	writeFile(t, root, "sub/.git/objects/cc.json", []byte("{}"))
+	writeFile(t, root, "app.yaml", []byte("a: 1"))
+
+	res, err := Scan(context.Background(), root, Options{ExcludeDirs: []string{"keep"}}, noGit())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := paths(res.Candidates); strings.Join(got, ",") != "app.yaml" {
+		t.Errorf("candidates = %v, want only app.yaml", got)
+	}
+	if res.Truncated {
+		t.Errorf("Truncated = true, want false")
+	}
+	for _, c := range res.Candidates {
+		if strings.HasPrefix(c.Path, ".git/") || strings.Contains(c.Path, "/.git/") {
+			t.Errorf("candidate inside .git: %s", c.Path)
+		}
+	}
+}
+
+// private-sync's own scratch files hold plaintext copies of tracked secrets and
+// must never be offered for tracking, whatever scan.exclude_files says.
+func TestScanSkipsOwnScratchFiles(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, ".env", []byte("A=1"))
+	writeFile(t, root, ".env.psv-merge", []byte("<<<<<<< local\nA=1\n=======\nA=2\n>>>>>>> remote\n"))
+	writeFile(t, root, ".env.psv-tmp-deadbeef", []byte("A=3"))
+	writeFile(t, root, "sub/config.yaml.psv-tmp-cafe", []byte("a: 1"))
+	writeFile(t, root, "sub/config.yaml.psv-merge", []byte("a: 1"))
+
+	// Both with the defaults and with a user list that replaces them.
+	for _, opts := range []Options{{}, {ExcludeFiles: []string{"keep.json"}}} {
+		res, err := Scan(context.Background(), root, opts, noGit())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := paths(res.Candidates); strings.Join(got, ",") != ".env" {
+			t.Errorf("opts %+v: candidates = %v, want only .env", opts, got)
+		}
+	}
+
+	if !isScratchName(".env.psv-merge") || !isScratchName(".env.psv-tmp-deadbeef") {
+		t.Error("isScratchName must match both scratch forms")
+	}
+	if isScratchName(".env") || isScratchName("config.yaml") {
+		t.Error("isScratchName must not match ordinary files")
+	}
+}
+
+// The hard-exclude check must fold case exactly like config.isWithin, or the
+// vault passphrase file is offered as a candidate when the project root is
+// spelled with different casing on a case-insensitive filesystem.
+func TestScanHardExcludeCaseInsensitive(t *testing.T) {
+	base := t.TempDir()
+	real := filepath.Join(base, "Work", "myapp")
+	if err := os.MkdirAll(real, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	key := filepath.Join(real, "app.key")
+	if err := os.WriteFile(key, []byte("passphrase"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, real, "app.yaml", []byte("a: 1"))
+	lower := filepath.Join(base, "work", "myapp")
+	if _, err := os.Stat(lower); err != nil {
+		t.Skip("case-sensitive filesystem")
+	}
+
+	// Hard exclude in the on-disk casing, scanned through the other casing.
+	res, err := Scan(context.Background(), lower, Options{HardExclude: []string{key}}, noGit())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := paths(res.Candidates); strings.Join(got, ",") != "app.yaml" {
+		t.Errorf("candidates = %v, want only app.yaml (key file must stay hidden)", got)
+	}
+}
+
+// A vault-tracked path whose parent is a symlinked directory must not escape
+// the project: the walk never follows symlinks, and neither may the tracked
+// fallback.
+func TestScanVaultTrackedThroughSymlinkedDirRejected(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlinks")
+	}
+	base := t.TempDir()
+	proj := filepath.Join(base, "p")
+	outside := filepath.Join(base, "elsewhere")
+	writeFile(t, proj, "in.yaml", []byte("a: 1"))
+	writeFile(t, outside, "outside.yaml", []byte("secret: 1"))
+	if err := os.Symlink(outside, filepath.Join(proj, "linkdir")); err != nil {
+		t.Skip("cannot create symlink:", err)
+	}
+	// A symlinked directory that stays inside the project is still allowed.
+	writeFile(t, proj, "real/inner.yaml", []byte("b: 2"))
+	if err := os.Symlink(filepath.Join(proj, "real"), filepath.Join(proj, "innerlink")); err != nil {
+		t.Fatal(err)
+	}
+
+	tracked := map[string]bool{
+		"linkdir/outside.yaml": true,
+		"innerlink/inner.yaml": true,
+	}
+	res, err := Scan(context.Background(), proj, Options{Tracked: tracked}, noGit())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := find(res.Candidates, "linkdir/outside.yaml"); ok {
+		t.Errorf("tracked path escaping through a symlinked dir was listed: %v", paths(res.Candidates))
+	}
+	if !hasWarning(res.Warnings, "linkdir/outside.yaml resolves outside the project") {
+		t.Errorf("warnings = %v, want one about the escaping tracked path", res.Warnings)
+	}
+	if _, ok := find(res.Candidates, "innerlink/inner.yaml"); !ok {
+		t.Errorf("tracked path resolving inside the project must stay listed: %v", paths(res.Candidates))
+	}
+	if _, ok := find(res.Candidates, "in.yaml"); !ok {
+		t.Errorf("in.yaml missing: %v", paths(res.Candidates))
 	}
 }

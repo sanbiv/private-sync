@@ -174,49 +174,82 @@ func TestRclonePushBlobsFirstThenOwnFiles(t *testing.T) {
 
 	written := []string{
 		"blobs/bb/y.enc",
-		"blobs/aa/x.enc",
-		"blobs/aa/x.enc", // duplicate
-		"./blobs/bb/y.enc",
-		filepath.Join(dir, "blobs", "aa", "x.enc"), // absolute inside the vault
-		"blobs/zz/missing.enc",                     // not on disk
-		"machines/" + mid + ".json.enc",            // not a blob
-		"../outside/blobs/q.enc",                   // escapes the vault
+		"machines/" + mid + ".json.enc",
+		"../outside/blobs/q.enc", // escapes the vault
 		"",
 	}
 	if err := r.Push(context.Background(), written, testLog(t)); err != nil {
 		t.Fatal(err)
 	}
-	if len(f.cmds) != 2 {
-		t.Fatalf("got %d commands, want 2:\n%v", len(f.cmds), f.cmds)
+	if len(f.cmds) != 3 {
+		t.Fatalf("got %d commands, want 3:\n%v", len(f.cmds), f.cmds)
 	}
-	// Blobs first.
-	assertCmd(t, f.cmds[0], dir, []string{"copy", dir, "gdrive:/vault", "--files-from", f.paths[0], "--no-traverse", "--ignore-existing", "--ask-password=false"})
-	if f.lists[0] != "blobs/aa/x.enc\nblobs/bb/y.enc\n" {
-		t.Errorf("blob list = %q", f.lists[0])
+	// Blobs first, as a whole tree (see pushBlobs).
+	assertCmd(t, f.cmds[0], dir, []string{"copy", filepath.Join(dir, "blobs"), "gdrive:/vault/blobs", "--ignore-existing", "--ask-password=false"})
+	// Then the bootstrap files, which never replace the remote copies.
+	assertCmd(t, f.cmds[1], dir, []string{"copy", dir, "gdrive:/vault", "--files-from", f.paths[1], "--no-traverse", "--ignore-existing", "--ask-password=false"})
+	if f.lists[1] != ".gitattributes\n" {
+		t.Errorf("bootstrap list = %q", f.lists[1])
 	}
-	// Then the own files.
-	assertCmd(t, f.cmds[1], dir, []string{"copy", dir, "gdrive:/vault", "--files-from", f.paths[1], "--no-traverse", "--ask-password=false"})
+	// Then the own files: vault.json is not one of them (it was not written).
+	assertCmd(t, f.cmds[2], dir, []string{"copy", dir, "gdrive:/vault", "--files-from", f.paths[2], "--no-traverse", "--ask-password=false"})
 	wantOwn := strings.Join([]string{
-		".gitattributes",
 		"machines/" + mid + ".json.enc",
 		"projects/p1/meta/" + mid + ".json.enc",
 		"projects/p1/state/" + mid + ".json.enc",
 		"projects/p2/state/" + mid + ".json.enc",
-		"vault.json",
 	}, "\n") + "\n"
-	if f.lists[1] != wantOwn {
-		t.Errorf("own list =\n%q\nwant\n%q", f.lists[1], wantOwn)
+	if f.lists[2] != wantOwn {
+		t.Errorf("own list =\n%q\nwant\n%q", f.lists[2], wantOwn)
 	}
-	for i, p := range f.paths {
+	for i, p := range f.paths[1:] {
 		if p == "" {
-			t.Fatalf("call %d has no --files-from", i)
+			t.Fatalf("call %d has no --files-from", i+1)
 		}
 		if !strings.HasPrefix(p, os.TempDir()) {
-			t.Errorf("list %d not in os.TempDir(): %q", i, p)
+			t.Errorf("list %d not in os.TempDir(): %q", i+1, p)
 		}
 		if _, err := os.Stat(p); err == nil {
-			t.Errorf("list %d not removed after Push: %q", i, p)
+			t.Errorf("list %d not removed after Push: %q", i+1, p)
 		}
+	}
+}
+
+// TestRclonePushHealsBlobsMissedByAnEarlierPush: a Push that fails after the
+// blobs were transferred must not strand them. The journals that reference
+// them are rebuilt from disk on every later run, so the blobs cannot be taken
+// from the current process's written list only.
+func TestRclonePushHealsBlobsMissedByAnEarlierPush(t *testing.T) {
+	f := newFakeRclone()
+	r, dir := newRcloneVault(t, f, config.RcloneRemote{Remote: "gdrive", Path: "vault"})
+	blob := "blobs/ab/abcdef.enc"
+	journal := "projects/p1/state/" + mid + ".json.enc"
+	mustWrite(t, dir, blob, "cipher")
+	mustWrite(t, dir, journal, "journal")
+
+	// Run 1: the blob transfer fails, so nothing is published.
+	f.script = func([]string, int) (execx.Result, bool) {
+		return exit(1, "2026/09/05 Failed to copy: connection reset by peer\n"), true
+	}
+	if err := r.Push(context.Background(), []string{blob, journal}, testLog(t)); err == nil {
+		t.Fatal("run 1: Push succeeded despite the blob failure")
+	}
+	if len(f.cmds) != 1 {
+		t.Fatalf("run 1: %d commands, want only the blob transfer", len(f.cmds))
+	}
+
+	// Run 2: a later process; the blob is on disk but nothing was written.
+	f.script = func([]string, int) (execx.Result, bool) { return execx.Result{}, false }
+	f.cmds, f.lists, f.paths = nil, nil, nil
+	if err := r.Push(context.Background(), nil, testLog(t)); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.cmds) != 2 {
+		t.Fatalf("run 2: %d commands, want 2:\n%v", len(f.cmds), f.cmds)
+	}
+	assertCmd(t, f.cmds[0], dir, []string{"copy", filepath.Join(dir, "blobs"), "gdrive:vault/blobs", "--ignore-existing", "--ask-password=false"})
+	if f.lists[1] != journal+"\n" {
+		t.Errorf("own list = %q, want the journal", f.lists[1])
 	}
 }
 
@@ -257,7 +290,6 @@ func TestRcloneOwnFilesGlobMetacharsInVaultDir(t *testing.T) {
 				"machines/" + mid + ".json.enc",
 				"projects/p1/meta/" + mid + ".json.enc",
 				"projects/p1/state/" + mid + ".json.enc",
-				"vault.json",
 			}, "\n") + "\n"
 			if f.lists[0] != want {
 				t.Errorf("own list =\n%q\nwant\n%q", f.lists[0], want)
@@ -266,38 +298,23 @@ func TestRcloneOwnFilesGlobMetacharsInVaultDir(t *testing.T) {
 	}
 }
 
-// TestRcloneWrittenBlobsMissingLoggedOnce: a missing blob listed several
-// times in written is examined (and reported) once.
-func TestRcloneWrittenBlobsMissingLoggedOnce(t *testing.T) {
+// TestRcloneEmptyBlobsDirIsNotPushed: an existing but empty blobs/ costs no
+// rclone invocation.
+func TestRcloneEmptyBlobsDirIsNotPushed(t *testing.T) {
 	f := newFakeRclone()
 	r, dir := newRcloneVault(t, f, config.RcloneRemote{Remote: "gdrive", Path: "v"})
-	mustWrite(t, dir, "blobs/aa/present.enc", "x")
-	written := []string{
-		"blobs/zz/missing.enc",
-		"blobs/zz/missing.enc",
-		"./blobs/zz/missing.enc",
-		filepath.Join(dir, "blobs", "zz", "missing.enc"),
-		"blobs/aa/present.enc",
-		"blobs/aa/present.enc",
-	}
-	var lines []string
-	if err := r.Push(context.Background(), written, func(s string) { lines = append(lines, s) }); err != nil {
+	if err := os.MkdirAll(filepath.Join(dir, "blobs"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	skips := 0
-	for _, l := range lines {
-		if strings.HasPrefix(l, "skipping missing blob ") {
-			skips++
-			if l != "skipping missing blob blobs/zz/missing.enc" {
-				t.Errorf("unexpected skip line %q", l)
-			}
-		}
+	mustWrite(t, dir, "machines/"+mid+".json.enc", "me")
+	if err := r.Push(context.Background(), nil, testLog(t)); err != nil {
+		t.Fatal(err)
 	}
-	if skips != 1 {
-		t.Errorf("missing blob logged %d times, want 1:\n%s", skips, strings.Join(lines, "\n"))
+	if len(f.cmds) != 1 {
+		t.Fatalf("got %d commands, want only the own-files copy: %v", len(f.cmds), f.cmds)
 	}
-	if len(f.cmds) != 1 || f.lists[0] != "blobs/aa/present.enc\n" {
-		t.Errorf("blob push = %d calls, list %q", len(f.cmds), f.lists)
+	if f.lists[0] != "machines/"+mid+".json.enc\n" {
+		t.Errorf("list = %q", f.lists[0])
 	}
 }
 
@@ -314,6 +331,169 @@ func TestRclonePushWithoutBlobs(t *testing.T) {
 	assertCmd(t, f.cmds[0], dir, []string{"copy", dir, "gdrive:v", "--files-from", f.paths[0], "--no-traverse", "--ask-password=false"})
 	if f.lists[0] != "machines/"+mid+".json.enc\n" {
 		t.Errorf("list = %q", f.lists[0])
+	}
+}
+
+// catScript answers `rclone cat <remote>/vault.json` with body (or, when
+// body is "", with rclone's "object not found" failure).
+func catScript(body string) func([]string, int) (execx.Result, bool) {
+	return func(args []string, _ int) (execx.Result, bool) {
+		if args[0] != "cat" {
+			return execx.Result{}, false
+		}
+		if body == "" {
+			return exit(4, "2026/09/05 10:00:00 Failed to cat: object not found\n"), true
+		}
+		return out(body), true
+	}
+}
+
+// TestRclonePushVaultFileOnlyWhenWritten guards spec §10.1 on the rclone
+// backend: vault.json is uploaded only by the process that wrote it, and it
+// replaces the remote copy only when both belong to the same vault. Pushing it
+// on every sync let a stale local copy overwrite (`rclone copy` is not
+// --update) another machine's freshly rewrapped key.
+func TestRclonePushVaultFileOnlyWhenWritten(t *testing.T) {
+	const localVault = `{"id":"vault-A"}`
+	cases := []struct {
+		name      string
+		written   []string
+		remote    string // remote vault.json body ("" = the remote has none)
+		wantCat   bool
+		wantCopy  []string // extra args of the vault.json copy (nil = no copy)
+		wantErrIs error
+	}{
+		{name: "not written", written: []string{"machines/" + mid + ".json.enc"}},
+		{name: "nothing written at all"},
+		{
+			name: "created: remote has none yet", written: []string{"vault.json"},
+			wantCat: true, wantCopy: []string{"--no-traverse", "--ignore-existing"},
+		},
+		{
+			name: "passphrase change: same vault", written: []string{"vault.json"}, remote: `{"id":"vault-A"}`,
+			wantCat: true, wantCopy: []string{"--no-traverse"},
+		},
+		{
+			name: "lost creation race", written: []string{"vault.json"}, remote: `{"id":"vault-B"}`,
+			wantCat: true, wantErrIs: ErrVaultConflict,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeRclone()
+			f.script = catScript(tc.remote)
+			r, dir := newRcloneVault(t, f, config.RcloneRemote{Remote: "gdrive", Path: "vault"})
+			mustWrite(t, dir, "vault.json", localVault)
+			mustWrite(t, dir, "machines/"+mid+".json.enc", "me")
+
+			err := r.Push(context.Background(), tc.written, testLog(t))
+			if tc.wantErrIs != nil {
+				if !errors.Is(err, tc.wantErrIs) {
+					t.Fatalf("err = %v, want one matching %v", err, tc.wantErrIs)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			var cats, copies int
+			for i, c := range f.cmds {
+				switch {
+				case c.Args[0] == "cat":
+					cats++
+					assertCmd(t, c, dir, []string{"cat", "gdrive:vault/vault.json", "--ask-password=false"})
+				case strings.Contains(f.lists[i], "vault.json"):
+					copies++
+					if f.lists[i] != "vault.json\n" {
+						t.Errorf("vault.json shares a list with other files: %q", f.lists[i])
+					}
+					want := append([]string{"copy", dir, "gdrive:vault", "--files-from", f.paths[i]}, tc.wantCopy...)
+					assertCmd(t, c, dir, append(want, "--ask-password=false"))
+				}
+			}
+			if cats != boolToInt(tc.wantCat) {
+				t.Errorf("%d `rclone cat` calls, want %d", cats, boolToInt(tc.wantCat))
+			}
+			if copies != boolToInt(tc.wantCopy != nil) {
+				t.Errorf("%d vault.json uploads, want %d", copies, boolToInt(tc.wantCopy != nil))
+			}
+			if got := mustRead(t, dir, "vault.json"); got != localVault {
+				t.Errorf("local vault.json changed: %q", got)
+			}
+		})
+	}
+}
+
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// TestRclonePushLostCreationRaceStopsBeforePublishing: when another machine
+// won the §10.1 creation race, Push reports it (so Setup can surface
+// ErrVaultRace, as the git backend already did) and uploads nothing at all —
+// the winner's wrapped key must survive.
+func TestRclonePushLostCreationRaceStopsBeforePublishing(t *testing.T) {
+	f := newFakeRclone()
+	f.script = catScript(`{"id":"winner"}`)
+	r, dir := newRcloneVault(t, f, config.RcloneRemote{Remote: "gdrive", Path: "vault"})
+	mustWrite(t, dir, "vault.json", `{"id":"loser"}`)
+	mustWrite(t, dir, "machines/"+mid+".json.enc", "me")
+	mustWrite(t, dir, "blobs/aa/x.enc", "cipher")
+
+	err := r.Push(context.Background(), []string{"vault.json", "machines/" + mid + ".json.enc"}, testLog(t))
+	if !errors.Is(err, ErrVaultConflict) {
+		t.Fatalf("err = %v, want ErrVaultConflict", err)
+	}
+	var vc *VaultConflict
+	if !errors.As(err, &vc) || vc.LocalID != "loser" || vc.RemoteID != "winner" {
+		t.Fatalf("conflict = %+v", vc)
+	}
+	if len(f.cmds) != 1 || f.cmds[0].Args[0] != "cat" {
+		t.Fatalf("Push transferred something after losing the race: %v", f.cmds)
+	}
+	if got := mustRead(t, dir, "vault.json"); got != `{"id":"loser"}` {
+		t.Errorf("local vault.json changed: %q", got)
+	}
+}
+
+// TestRcloneRemoteVaultIDErrors: only a genuine "not found" counts as "the
+// remote has no vault.json"; anything else must stop the push.
+func TestRcloneRemoteVaultIDErrors(t *testing.T) {
+	cases := []struct {
+		name    string
+		res     execx.Result
+		wantErr string
+	}{
+		{"missing object", exit(4, "2026/09/05 Failed to cat: object not found\n"), ""},
+		{"missing folder", exit(3, "2026/09/05 ERROR : : directory not found\n"), ""},
+		{"generic exit with not-found text", exit(1, "2026/09/05 Failed to cat with 1 error: object not found\n"), ""},
+		{"config file missing is not a missing vault", exit(1, "2026/09/05 Failed to load config: config file not found\n"), "not configured"},
+		{"network failure", exit(1, "2026/09/05 Failed to cat: dial tcp: connection refused\n"), "connection refused"},
+		{"corrupt vault.json", out("not json"), "unreadable"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeRclone()
+			f.script = func(args []string, _ int) (execx.Result, bool) {
+				if args[0] == "cat" {
+					return tc.res, true
+				}
+				return execx.Result{}, false
+			}
+			r, dir := newRcloneVault(t, f, config.RcloneRemote{Remote: "gdrive", Path: "vault"})
+			mustWrite(t, dir, "vault.json", `{"id":"v"}`)
+			err := r.Push(context.Background(), []string{"vault.json"}, testLog(t))
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Push: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("err = %v, want one containing %q", err, tc.wantErr)
+			}
+		})
 	}
 }
 
@@ -345,9 +525,6 @@ func TestRclonePushStopsOnBlobFailure(t *testing.T) {
 	}
 	if len(f.cmds) != 1 {
 		t.Errorf("own files pushed after blob failure: %d calls", len(f.cmds))
-	}
-	if _, statErr := os.Stat(f.paths[0]); statErr == nil {
-		t.Errorf("files-from list leaked after failure")
 	}
 }
 

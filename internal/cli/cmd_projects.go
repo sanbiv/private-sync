@@ -339,7 +339,7 @@ func (c *cli) listProjects(cmd *cobra.Command, s *app.Session) error {
 			lv := linkedView{ID: p.ID, Name: p.Name, Path: p.Path}
 			if pp := byID[p.ID]; pp != nil {
 				lv.Badge = badge(pp)
-				lv.State = toSummaryView(sync.Summarize(pp))
+				lv.State = toSummaryView(summarize(pp))
 				if lv.Name == "" {
 					lv.Name = pp.Name
 				}

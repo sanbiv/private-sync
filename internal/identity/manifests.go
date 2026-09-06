@@ -130,8 +130,9 @@ func detectPyproject(dir string) string {
 }
 
 // tomlSections is a minimal section → key → value map. Only top-level
-// "key = value" lines inside [section] headers are recorded; arrays of tables,
-// inline tables and multi-line strings are ignored, which suffices for names.
+// "key = value" lines inside [section] headers are recorded; arrays of tables
+// and inline tables are ignored, which suffices for names. Multi-line strings
+// are consumed as a unit so their contents are never parsed as structure.
 type tomlSections map[string]map[string]string
 
 func (t tomlSections) get(section, key string) string {
@@ -172,6 +173,16 @@ func parseTOMLSections(content string) tomlSections {
 		if !found {
 			continue
 		}
+		// A multi-line string must be consumed here: its body may otherwise
+		// look like a section header ("[package]") or a key, retargeting the
+		// parse and yielding a wrong name. Do this before the key check so an
+		// unusable key still skips the body.
+		scalar := ""
+		if delim := tomlMultilineDelim(val); delim != "" {
+			scalar = consumeTOMLMultiline(sc, val, delim)
+		} else {
+			scalar = tomlScalar(val)
+		}
 		key = normalizeTOMLKey(key)
 		if key == "" {
 			continue
@@ -180,10 +191,46 @@ func parseTOMLSections(content string) tomlSections {
 			out[section] = map[string]string{}
 		}
 		if _, dup := out[section][key]; !dup {
-			out[section][key] = tomlScalar(val)
+			out[section][key] = scalar
 		}
 	}
 	return out
+}
+
+// tomlMultilineDelim returns the multi-line delimiter (three double quotes or
+// three single quotes) that val opens without closing on the same line, or ""
+// when val is a single-line value.
+func tomlMultilineDelim(val string) string {
+	v := strings.TrimSpace(val)
+	for _, delim := range []string{`"""`, `'''`} {
+		if strings.HasPrefix(v, delim) {
+			if strings.Contains(v[len(delim):], delim) {
+				return "" // opened and closed on this line
+			}
+			return delim
+		}
+	}
+	return ""
+}
+
+// consumeTOMLMultiline reads the body of a multi-line string opened on first
+// (which starts with delim) up to and including the closing delimiter, and
+// returns its contents. Lines consumed here are never parsed as TOML structure.
+func consumeTOMLMultiline(sc *bufio.Scanner, first, delim string) string {
+	var b strings.Builder
+	b.WriteString(strings.TrimPrefix(strings.TrimSpace(first), delim))
+	for sc.Scan() {
+		line := sc.Text()
+		b.WriteByte('\n')
+		if end := strings.Index(line, delim); end >= 0 {
+			b.WriteString(line[:end])
+			break
+		}
+		b.WriteString(line)
+	}
+	// Unterminated strings simply end at EOF; the loop above stops with the
+	// scanner exhausted, so no further lines are misparsed.
+	return strings.TrimSpace(b.String())
 }
 
 // normalizeTOMLKey trims whitespace and quotes around each dotted component.
@@ -335,6 +382,13 @@ func detectPackageSwift(dir string) string {
 	content := readManifest(dir, "Package.swift")
 	if content == "" {
 		return ""
+	}
+	// ".target(name:)", ".library(name:)" and friends use the same label and
+	// may precede the Package(...) initialiser (targets hoisted into a `let`),
+	// so anchor the search to that call. Files without it keep the plain
+	// first-match behaviour.
+	if i := strings.Index(content, "Package("); i >= 0 {
+		content = content[i+len("Package("):]
 	}
 	if sm := swiftNameRe.FindStringSubmatch(content); sm != nil {
 		return strings.TrimSpace(sm[1])

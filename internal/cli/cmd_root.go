@@ -350,6 +350,9 @@ func (c *cli) passphraseCommand() *cobra.Command {
 
 // changePassphrase asks for the new passphrase twice, rekeys and pushes vault.json.
 func (c *cli) changePassphrase(ctx context.Context) error {
+	if err := errEnvPassphraseRekey(); err != nil {
+		return err
+	}
 	s, err := c.openSession(ctx)
 	if err != nil {
 		return err
@@ -406,8 +409,8 @@ func (c *cli) changePassphrase(ctx context.Context) error {
 	}
 	pushed := false
 	if !c.g.noRemote {
-		log := func(line string) { fmt.Fprintf(c.errOut, "push: %s\n", line) }
-		if err := s.Remote.Push(ctx, []string{vault.VaultFileName}, log); err != nil {
+		if err := s.Remote.Push(ctx, []string{vault.VaultFileName}, c.remoteLogger("push")); err != nil {
+			c.dumpRemoteLog()
 			return pushAfterRekeyError(err)
 		}
 		pushed = true
@@ -421,6 +424,18 @@ func (c *cli) changePassphrase(ctx context.Context) error {
 	}
 	fmt.Fprintf(c.out, "passphrase changed for vault %s\n", s.Vault.ID())
 	return nil
+}
+
+// errEnvPassphraseRekey refuses a rekey while PRIVATE_SYNC_PASSPHRASE was
+// captured at startup: keysource.Obtain prefers that value over every
+// configured source (spec §11), so rewrapping the vault key would leave the
+// captured passphrase stale and no command in that environment could open the
+// vault again — the same hazard app.Setup reports as ErrKeyFileEnvMismatch.
+func errEnvPassphraseRekey() error {
+	if !envPassphraseInUse() {
+		return nil
+	}
+	return fmt.Errorf("%s is set and overrides the configured key source: unset it and run `private-sync passphrase change` again (rekeying now would leave that stale passphrase in use and lock this environment out of the vault)", keysource.EnvVar)
 }
 
 // pushAfterRekeyError explains a failed push of vault.json after a successful

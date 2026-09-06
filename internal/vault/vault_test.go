@@ -631,13 +631,15 @@ func TestBlobs(t *testing.T) {
 		t.Errorf("Written() = %v", got)
 	}
 
-	// Another machine writes the same plaintext: byte-identical file, created=false.
+	// Another machine writes the same plaintext: byte-identical file,
+	// created=false, but still recorded: its journals may reference the blob,
+	// so the transport has to push it (see TestWriteBlobRecordsDedupedBlob).
 	other := openAs(t, dir, mB)
 	if _, created, err := other.WriteBlob(pt); err != nil || created {
 		t.Errorf("other machine WriteBlob: created=%v err=%v", created, err)
 	}
-	if len(other.Written()) != 0 {
-		t.Errorf("other machine recorded a write it skipped: %v", other.Written())
+	if got := other.Written(); !reflect.DeepEqual(got, []string{rel}) {
+		t.Errorf("other machine Written() = %v, want [%s]", got, rel)
 	}
 
 	got, err := v.ReadBlob(id)

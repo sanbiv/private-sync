@@ -133,8 +133,8 @@ func TestStartRekeyUpdatesKeyFileOnFileSource(t *testing.T) {
 	s.Config.Key.Source = config.KeyFile
 	s.Config.Key.File.Path = keyPath
 
-	m := &settingsModel{ctx: context.Background(), s: s, pass1: "new-passphrase-xyz", pass2: "new-passphrase-xyz"}
-	msg := m.startRekey()()
+	m := &settingsModel{ctx: context.Background(), s: s}
+	msg := m.startRekey([]byte("new-passphrase-xyz"))()
 	done, ok := msg.(rekeyDoneMsg)
 	if !ok {
 		t.Fatalf("startRekey() = %#v, want a rekeyDoneMsg", msg)
@@ -156,8 +156,8 @@ func TestStartRekeyWarnsForBitwardenSource(t *testing.T) {
 	s.Config.Key.Source = config.KeyBitwarden
 	s.Config.Key.Bitwarden.Item = "my-vault-item"
 
-	m := &settingsModel{ctx: context.Background(), s: s, pass1: "new-passphrase-xyz", pass2: "new-passphrase-xyz"}
-	msg := m.startRekey()()
+	m := &settingsModel{ctx: context.Background(), s: s}
+	msg := m.startRekey([]byte("new-passphrase-xyz"))()
 	done, ok := msg.(rekeyDoneMsg)
 	if !ok {
 		t.Fatalf("startRekey() = %#v, want a rekeyDoneMsg", msg)
@@ -179,8 +179,8 @@ func TestStartRekeyFailsCleanlyWhenKeyFileMissing(t *testing.T) {
 	s.Config.Key.Source = config.KeyFile
 	s.Config.Key.File.Path = filepath.Join(t.TempDir(), "does-not-exist")
 
-	m := &settingsModel{ctx: context.Background(), s: s, pass1: "new-passphrase-xyz", pass2: "new-passphrase-xyz"}
-	msg := m.startRekey()()
+	m := &settingsModel{ctx: context.Background(), s: s}
+	msg := m.startRekey([]byte("new-passphrase-xyz"))()
 	done, ok := msg.(rekeyDoneMsg)
 	if !ok {
 		t.Fatalf("startRekey() = %#v, want a rekeyDoneMsg", msg)
@@ -195,8 +195,8 @@ func TestStartRekeyFailsCleanlyWhenKeyFileMissing(t *testing.T) {
 
 func TestStartRekeyPromptSourceNeedsNoFileUpdate(t *testing.T) {
 	s := newTestSession(t) // config.Default leaves Key.Source at KeyPrompt
-	m := &settingsModel{ctx: context.Background(), s: s, pass1: "new-passphrase-xyz", pass2: "new-passphrase-xyz"}
-	msg := m.startRekey()()
+	m := &settingsModel{ctx: context.Background(), s: s}
+	msg := m.startRekey([]byte("new-passphrase-xyz"))()
 	done, ok := msg.(rekeyDoneMsg)
 	if !ok {
 		t.Fatalf("startRekey() = %#v, want a rekeyDoneMsg", msg)

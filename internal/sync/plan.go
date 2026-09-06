@@ -503,6 +503,13 @@ func (pl *planner) decide(p string, local *FileRef, localText []byte, base *File
 				pl.pending(&it, base.Blob, err)
 				return pl.finish(it, note)
 			}
+			// A zero-length plaintext reads back as a nil slice; merge.ThreeWay
+			// reads a nil base as "no common ancestor" (row 10), so an empty
+			// base must still be handed over as a non-nil empty slice. The
+			// presence of a KindFile base entry is what says a base exists.
+			if baseText == nil {
+				baseText = []byte{}
+			}
 			it.BaseText = baseText
 			it.Action = ActionConflict
 			it.Conflict = ConflictContent
@@ -658,6 +665,12 @@ func (pl *planner) loadHeadText(it *Item) bool {
 		pl.pending(it, it.Head.Blob, err)
 		return false
 	}
+	// A zero-length plaintext reads back as a nil slice: normalise it so that
+	// "the vault version is an empty file" stays distinguishable from "no head
+	// content" for every consumer of HeadText.
+	if text == nil {
+		text = []byte{}
+	}
 	it.HeadText = text
 	return true
 }
@@ -717,11 +730,18 @@ func (pl *planner) premerge(it *Item, p string, head vault.Head, local *FileRef,
 			pl.pending(it, head.Base, err)
 			return false
 		}
+		// An empty base plaintext reads back as nil, which merge.ThreeWay
+		// takes for "no common ancestor": keep it non-nil so an empty base
+		// still merges as a base.
+		if b == nil {
+			b = []byte{}
+		}
 		baseText = b
 	}
 	texts := make([][]byte, len(cands))
 	tombstones := 0
 	firstFile := -1
+	ownFile := -1
 	for i, c := range cands {
 		if c.Kind != vault.KindFile {
 			tombstones++
@@ -730,21 +750,40 @@ func (pl *planner) premerge(it *Item, p string, head vault.Head, local *FileRef,
 		if firstFile < 0 {
 			firstFile = i
 		}
+		if ownFile < 0 && c.Machine == pl.e.machine.ID {
+			ownFile = i
+		}
 		t, err := pl.e.vault.ReadBlob(c.Blob)
 		if err != nil {
 			pl.pending(it, c.Blob, err)
 			return false
 		}
+		if t == nil { // zero-length candidate: never a nil "missing" marker
+			t = []byte{}
+		}
 		texts[i] = t
 	}
-	fail := func(r *merge.Result, reason string) {
+	// ownText is this machine's side of the conflict, the one the resolver
+	// labels "local": its own candidate when it published one, otherwise the
+	// local working copy.
+	ownText := localText
+	if ownFile >= 0 {
+		ownText = texts[ownFile]
+	}
+	// fail turns the item into a concurrent conflict. When fold is non-nil (the
+	// pre-merge below did not come out clean) it also builds it.Merge, oriented
+	// the way every other field of the item is: Local = this machine's side,
+	// Remote = the side HeadText shows. The fold itself runs in candidate order
+	// so that every machine agrees on the merged head, but that order is
+	// machine-id order, so its own Result must never reach the resolver — it
+	// would swap the two sides on every machine but the lowest id.
+	fail := func(fold *merge.Result, reason string) {
 		it.Action = ActionConflict
 		it.Conflict = ConflictConcurrent
-		it.Merge = r
+		it.Merge = nil
 		it.NeedsResolution = true
 		it.LocalText = localText
 		it.BaseText = baseText
-		it.Reason = reason
 		remote, ambiguous := pl.remoteSide(cands)
 		if remote >= 0 {
 			it.Remote = refFromEntry(&cands[remote])
@@ -775,6 +814,30 @@ func (pl *planner) premerge(it *Item, p string, head vault.Head, local *FileRef,
 				it.HeadText = texts[shown]
 			}
 		}
+		if fold != nil {
+			it.Merge = fold
+			// Only a single, file-valued remote side makes "local vs remote"
+			// mean anything; when the other machines disagree there is no side
+			// to label and the fold's own result is all there is to show.
+			if !ambiguous && remote >= 0 && cands[remote].Kind == vault.KindFile && it.HeadText != nil {
+				it.Merge = merge.ThreeWay(p, baseText, ownText, it.HeadText)
+			}
+			// Count the hunks the user will actually be shown; a fold that only
+			// fails between two other machines can still merge cleanly against
+			// this machine's own side, so fall back to the fold's count.
+			hunks := fold
+			if !it.Merge.Clean {
+				hunks = it.Merge
+			}
+			why := "no common base"
+			if baseText != nil {
+				why = fmt.Sprintf("%d conflicting %s", len(hunks.Hunks), plural(len(hunks.Hunks), "hunk", "hunks"))
+			}
+			reason = fmt.Sprintf("concurrent vault heads (%s): %s", why, reason)
+		} else {
+			reason = fmt.Sprintf("concurrent vault heads: %s", reason)
+		}
+		it.Reason = reason
 		switch {
 		case ambiguous:
 			it.Reason += "; no single remote side (several other machines disagree)"
@@ -785,18 +848,14 @@ func (pl *planner) premerge(it *Item, p string, head vault.Head, local *FileRef,
 		}
 	}
 	if tombstones > 0 || firstFile < 0 {
-		fail(nil, fmt.Sprintf("concurrent vault heads: %s", describeCandidates(cands)))
+		fail(nil, describeCandidates(cands))
 		return false
 	}
 	cur := texts[0]
 	for i := 1; i < len(cands); i++ {
 		r := merge.ThreeWay(p, baseText, cur, texts[i])
 		if !r.Clean {
-			why := "no common base"
-			if baseText != nil {
-				why = fmt.Sprintf("%d conflicting %s", len(r.Hunks), plural(len(r.Hunks), "hunk", "hunks"))
-			}
-			fail(r, fmt.Sprintf("concurrent vault heads (%s): %s", why, describeCandidates(cands)))
+			fail(r, describeCandidates(cands))
 			return false
 		}
 		cur = r.Merged

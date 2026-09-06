@@ -131,17 +131,45 @@ type Session struct {
 	Warn func(string)
 }
 
+// OpenOptions tunes how Open reaches the remote.
+type OpenOptions struct {
+	// NoRemote skips the remote entirely (the --no-remote flag, spec §2.1):
+	// nothing is prepared, fetched or pushed and the local vault copy is used
+	// as it is on disk.
+	NoRemote bool
+
+	// Warn receives non-fatal problems (an unreachable remote whose local
+	// vault copy is usable). It also becomes the Session's Warn; nil discards.
+	Warn func(string)
+}
+
 // Open prepares the remote (no fetch), obtains the key, opens the vault and checks the pin.
 //
 // The passphrase is only requested once the remote is prepared and vault.json
 // is known to exist, so an unreachable remote or a missing vault never costs
 // the user a prompt or a Bitwarden unlock.
 func (a *App) Open(ctx context.Context, p ui.Prompter) (*Session, error) {
+	return a.OpenWith(ctx, p, OpenOptions{})
+}
+
+// OpenWith is Open with explicit remote handling (spec §2.1: status, projects
+// list, trash, unlock and the TUI are offline commands).
+//
+// Preparing the remote is a convenience, not a precondition: when it fails but
+// the vault is present locally, the failure is reported through opts.Warn and
+// the local copy is used, exactly as a failed fetch is downgraded to a warning
+// by the front ends. Only a missing local vault turns the failure into an
+// error, because then the remote is the only place the vault could come from.
+func (a *App) OpenWith(ctx context.Context, p ui.Prompter, opts OpenOptions) (*Session, error) {
 	if err := a.check(); err != nil {
 		return nil, err
 	}
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	warn := opts.Warn
+	if warn == nil {
+		warn = discard
 	}
 	vaultDir, err := a.Config.VaultPath()
 	if err != nil {
@@ -151,8 +179,16 @@ func (a *App) Open(ctx context.Context, p ui.Prompter) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := rem.Prepare(ctx, discard); err != nil {
-		return nil, fmt.Errorf("prepare remote %s: %w", rem.Name(), err)
+	if !opts.NoRemote {
+		if err := rem.Prepare(ctx, discard); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
+			if !vault.Exists(vaultDir) {
+				return nil, fmt.Errorf("prepare remote %s: %w", rem.Name(), err)
+			}
+			warn(fmt.Sprintf("prepare remote %s failed: %v (continuing with the local vault copy)", rem.Name(), err))
+		}
 	}
 	if !vault.Exists(vaultDir) {
 		return nil, noVaultError(vaultDir)
@@ -174,7 +210,7 @@ func (a *App) Open(ctx context.Context, p ui.Prompter) (*Session, error) {
 		v.Close()
 		return nil, err
 	}
-	return a.session(v, rem, discard)
+	return a.session(v, rem, warn)
 }
 
 // noVaultError wraps vault.ErrNoVault with the path and the remedy.
@@ -362,6 +398,11 @@ func (a *App) setupCreate(ctx context.Context, p ui.Prompter, log func(string), 
 		discardKeyFile()
 		return nil, err
 	}
+	// published records that Push handed vault.json to the remote. From that
+	// moment a generated key file is the only copy of the passphrase that
+	// unwraps the vault key stored in it, so no later failure may delete it:
+	// the vault on the remote would be unopenable forever (§11).
+	published := false
 	// fail undoes the local side of a failed creation so the next init starts
 	// from the remote's state instead of adopting an unverified local vault.
 	fail := func(err error) (*Session, error) {
@@ -369,7 +410,11 @@ func (a *App) setupCreate(ctx context.Context, p ui.Prompter, log func(string), 
 		id := v.ID()
 		v.Close()
 		removeLocalVault(vaultDir, id, written, log)
-		discardKeyFile()
+		if published {
+			err = keptKeyFile(createdKeyFile, id, err, log)
+		} else {
+			discardKeyFile()
+		}
 		if a.Config.Vault.Remote.Type == config.RemoteGit {
 			err = discardLocalHistory(vaultDir, hadGit, err, log)
 		}
@@ -382,6 +427,7 @@ func (a *App) setupCreate(ctx context.Context, p ui.Prompter, log func(string), 
 	if err := rem.Push(ctx, withVaultFile(v.Written()), log); err != nil {
 		return fail(raceOr(err, fmt.Errorf("push to remote %s: %w", rem.Name(), err)))
 	}
+	published = true
 	log("verifying vault id")
 	if err := rem.Fetch(ctx, log); err != nil {
 		return fail(raceOr(err, fmt.Errorf("fetch remote %s: %w", rem.Name(), err)))
@@ -400,6 +446,24 @@ func (a *App) setupCreate(ctx context.Context, p ui.Prompter, log func(string), 
 	}
 	log(fmt.Sprintf("created vault %s", v.ID()))
 	return a.session(v, rem, log)
+}
+
+// keptKeyFile explains a generated key file that a failed creation keeps.
+//
+// vault.json carries the KDF salt and the vault key wrapped under the
+// passphrase in that file; once it has reached the remote, removing the file
+// destroys the only copy of a passphrase the user never saw (it is random),
+// so the vault would be lost. The remedy is the opposite of a cleanup:
+// keep the file and re-run init, which opens the vault that was just created.
+func keptKeyFile(path, vaultID string, err error, log func(string)) error {
+	if path == "" {
+		return err
+	}
+	if log == nil {
+		log = discard
+	}
+	log(fmt.Sprintf("kept generated key file %s: vault %s already reached the remote and that file holds the only copy of its passphrase", path, vaultID))
+	return fmt.Errorf("%w; vault %s already reached the remote: keep the key file %s (it holds the only copy of its passphrase) and re-run init to open that vault", err, vaultID, path)
 }
 
 // raceOr maps a remote error that means "another machine's vault.json won"

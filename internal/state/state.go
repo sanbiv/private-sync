@@ -24,6 +24,7 @@
 package state
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -777,6 +778,20 @@ func sortTrash(entries []TrashEntry) {
 	})
 }
 
+// sameTrashBlobOnDisk reports whether path already holds exactly ciphertext.
+// Lstat first: only a regular file of the right size is a candidate, so a
+// directory, a symlink (dangling or not) and a truncated or torn file all read
+// as "not stored" and are replaced by the caller's atomic write. The size check
+// also keeps a differing file from being read into memory just to find that out.
+func sameTrashBlobOnDisk(path string, ciphertext []byte) bool {
+	st, err := os.Lstat(path)
+	if err != nil || !st.Mode().IsRegular() || st.Size() != int64(len(ciphertext)) {
+		return false
+	}
+	existing, err := os.ReadFile(path)
+	return err == nil && bytes.Equal(existing, ciphertext)
+}
+
 // TrashPut stores content encrypted (deterministic blob format) and indexes it.
 func (s *Store) TrashPut(k *crypto.Keys, project, path string, content []byte, mode uint32) (TrashEntry, error) {
 	if s == nil {
@@ -814,8 +829,13 @@ func (s *Store) TrashPut(k *crypto.Keys, project, path string, content []byte, m
 		return TrashEntry{}, fmt.Errorf("state.TrashPut: %w", err)
 	}
 	// Identical pre-images share one file: the format is deterministic, so a
-	// concurrent writer of the same blob produces byte-identical content.
-	if !fsutil.Exists(blobPath) {
+	// concurrent writer of the same blob produces byte-identical content. The
+	// dedupe only skips the write when the file really holds that ciphertext:
+	// the trash is the only copy of a pre-image the engine is about to
+	// overwrite, so anything else on that path (a directory, a symlink, a
+	// truncated or torn file left by a restore or a file-sync client) must be
+	// replaced rather than trusted.
+	if !sameTrashBlobOnDisk(blobPath, ciphertext) {
 		if err := fsutil.WriteFileAtomic(blobPath, ciphertext, fileMode, s.suffix); err != nil {
 			return TrashEntry{}, fmt.Errorf("state.TrashPut: write blob: %w", err)
 		}

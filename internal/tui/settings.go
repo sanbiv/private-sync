@@ -48,9 +48,10 @@ type settingsModel struct {
 	excludeFilesCSV          string
 	wantRekey                bool
 
-	rekeyForm    *huh.Form
-	pass1, pass2 string
-	rekeyErr     string
+	// rekey collects the new passphrase in zeroable []byte buffers rather
+	// than in huh-bound Go strings, which cannot be overwritten.
+	rekey    *rekeyPrompt
+	rekeyErr string
 	// rekeyWarning carries a non-fatal note to show once rekeying settles
 	// (e.g. "update the Bitwarden item by hand"), set by startRekey.
 	rekeyWarning string
@@ -149,17 +150,6 @@ func (m *settingsModel) buildForm() *huh.Form {
 		WithTheme(huh.ThemeCharm())
 }
 
-func (m *settingsModel) buildRekeyForm() *huh.Form {
-	m.pass1, m.pass2 = "", ""
-	group := huh.NewGroup(
-		huh.NewInput().Title("New passphrase").EchoMode(huh.EchoModePassword).Value(&m.pass1).
-			Validate(requiredField("passphrase")),
-		huh.NewInput().Title("Confirm passphrase").EchoMode(huh.EchoModePassword).Value(&m.pass2).
-			Validate(requiredField("passphrase")),
-	).Title("Change passphrase")
-	return huh.NewForm(group).WithTheme(huh.ThemeCharm())
-}
-
 func (m *settingsModel) SetSize(w, h int) {
 	m.width, m.height = w, h
 	if m.sv != nil {
@@ -213,9 +203,10 @@ func (m *settingsModel) updateForm(msg tea.Msg) (bool, tea.Cmd) {
 			return false, tea.Batch(cmd, m.form.Init())
 		}
 		if m.wantRekey {
-			m.rekeyForm = m.buildRekeyForm()
+			m.rekeyErr = ""
+			m.rekey = newRekeyPrompt()
 			m.step = settingsStepRekeyForm
-			return false, tea.Batch(cmd, m.rekeyForm.Init())
+			return false, cmd
 		}
 		m.step = settingsStepDone
 		return false, cmd
@@ -261,28 +252,36 @@ func (m *settingsModel) save() error {
 }
 
 func (m *settingsModel) updateRekeyForm(msg tea.Msg) (bool, tea.Cmd) {
-	if key, ok := msg.(tea.KeyMsg); ok && key.String() == "esc" {
+	if m.rekey == nil {
 		m.step = settingsStepDone
 		return false, nil
 	}
-	next, cmd := m.rekeyForm.Update(msg)
-	if f, ok := next.(*huh.Form); ok {
-		m.rekeyForm = f
-	}
-	switch m.rekeyForm.State {
-	case huh.StateAborted:
+	switch m.rekey.update(msg) {
+	case rekeyPromptCancel:
+		m.rekey.Zero()
+		m.rekey = nil
 		m.step = settingsStepDone
-		return false, cmd
-	case huh.StateCompleted:
-		if m.pass1 != m.pass2 {
-			m.rekeyErr = "passphrases do not match"
-			m.rekeyForm = m.buildRekeyForm()
-			m.step = settingsStepRekeyForm
-			return false, tea.Batch(cmd, m.rekeyForm.Init())
+		return false, nil
+	case rekeyPromptSubmit:
+		if m.rekey.blank() {
+			m.rekeyErr = "the new passphrase must not be empty"
+			m.rekey.reset()
+			return false, nil
 		}
-		return false, tea.Batch(cmd, m.startRekey())
+		if !m.rekey.match() {
+			m.rekeyErr = "passphrases do not match"
+			m.rekey.reset()
+			return false, nil
+		}
+		m.rekeyErr = ""
+		// One copy for startRekey (which owns and zeroes it); the prompt's
+		// own buffers are wiped immediately.
+		pass := append([]byte(nil), m.rekey.first()...)
+		m.rekey.Zero()
+		m.rekey = nil
+		return false, m.startRekey(pass)
 	}
-	return false, cmd
+	return false, nil
 }
 
 // rekeyDoneMsg reports that Vault.Rekey (and, for key.source=file, the key
@@ -301,10 +300,10 @@ type rekeyDoneMsg struct {
 // key file by hand. This mirrors the CLI's `passphrase change`
 // (internal/cli/cmd_root.go's updateKeyFile): resolve symlinks, then an
 // atomic 0600 write.
-func (m *settingsModel) startRekey() tea.Cmd {
+// startRekey takes ownership of pass and zeroes it when it is done; the
+// caller must not keep another reference to it.
+func (m *settingsModel) startRekey(pass []byte) tea.Cmd {
 	m.step = settingsStepRekeying
-	pass := []byte(m.pass1)
-	m.pass1, m.pass2 = "", ""
 	v := m.s.Vault
 	cfg := m.s.Config
 	return func() tea.Msg {
@@ -391,7 +390,9 @@ func (m *settingsModel) View() string {
 		if m.rekeyErr != "" {
 			b.WriteString(styles.Error.Render(m.rekeyErr) + "\n")
 		}
-		b.WriteString(m.rekeyForm.View())
+		if m.rekey != nil {
+			b.WriteString(m.rekey.View())
+		}
 	case settingsStepRekeying:
 		if m.sv != nil {
 			b.WriteString(m.sv.View())

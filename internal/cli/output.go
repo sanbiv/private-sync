@@ -98,27 +98,71 @@ type projectView struct {
 	Warnings    []string    `json:"warnings,omitempty"`
 }
 
-// summaryView is sync.Summary with JSON tags.
+// summaryView is summary with JSON tags.
 type summaryView struct {
-	InSync        int `json:"in_sync"`
-	LocalChanges  int `json:"local_changes"`
-	RemoteChanges int `json:"remote_changes"`
-	Conflicts     int `json:"conflicts"`
-	Pending       int `json:"pending"`
-	Rollback      int `json:"rollback"`
-	Missing       int `json:"missing"`
+	InSync         int `json:"in_sync"`
+	LocalChanges   int `json:"local_changes"`
+	RemoteChanges  int `json:"remote_changes"`
+	Conflicts      int `json:"conflicts"`
+	Pending        int `json:"pending"`
+	Rollback       int `json:"rollback"`
+	Missing        int `json:"missing"`
+	DeletedInVault int `json:"deleted_in_vault,omitempty"`
 }
 
-func toSummaryView(s sync.Summary) summaryView {
+func toSummaryView(s summary) summaryView {
 	return summaryView{
-		InSync:        s.InSync,
-		LocalChanges:  s.LocalChanges,
-		RemoteChanges: s.RemoteChanges,
-		Conflicts:     s.Conflicts,
-		Pending:       s.Pending,
-		Rollback:      s.Rollback,
-		Missing:       s.Missing,
+		InSync:         s.InSync,
+		LocalChanges:   s.LocalChanges,
+		RemoteChanges:  s.RemoteChanges,
+		Conflicts:      s.Conflicts,
+		Pending:        s.Pending,
+		Rollback:       s.Rollback,
+		Missing:        s.Missing,
+		DeletedInVault: s.DeletedInVault,
 	}
+}
+
+// summary is sync.Summary with the decision table row 9 items split out of
+// Missing: they are deleted in the vault but still present on disk, so
+// counting them as "missing locally" contradicts what the user sees.
+type summary struct {
+	sync.Summary
+	DeletedInVault int
+}
+
+// deletedInVault reports whether it is row 9 (or its too-large variant): the
+// vault head is a tombstone the base already records, and the local copy is
+// deliberately left in place. Plan reports these with Original
+// ActionMissingLocal, which sync.Summarize counts as Missing; a genuine
+// ActionMissingLocal has no local file at all (Local == nil).
+func deletedInVault(it *sync.Item) bool {
+	if it == nil || it.Local == nil {
+		return false
+	}
+	a := it.Action
+	if a == sync.ActionReportOnly {
+		a = it.Original
+	}
+	return a == sync.ActionMissingLocal
+}
+
+// summarize is sync.Summarize with the row 9 items moved to DeletedInVault.
+func summarize(pp *sync.ProjectPlan) summary {
+	s := summary{Summary: sync.Summarize(pp)}
+	if pp == nil {
+		return s
+	}
+	for i := range pp.Items {
+		if deletedInVault(&pp.Items[i]) {
+			s.Missing--
+			s.DeletedInVault++
+		}
+	}
+	if s.Missing < 0 {
+		s.Missing = 0
+	}
+	return s
 }
 
 // badge summarises a project's plan in one word for lists and status.
@@ -134,7 +178,7 @@ func badge(pp *sync.ProjectPlan) string {
 	case pp.Unreadable:
 		return "unreadable"
 	}
-	s := sync.Summarize(pp)
+	s := summarize(pp)
 	switch {
 	case s.Conflicts > 0:
 		return "conflicts"
@@ -150,12 +194,14 @@ func badge(pp *sync.ProjectPlan) string {
 		return "remote changes"
 	case s.Missing > 0:
 		return "missing locally"
+	case s.DeletedInVault > 0:
+		return "deleted in the vault, local copy kept"
 	}
 	return "synced"
 }
 
-// summaryText renders a Summary for humans ("2 in sync, 1 local change").
-func summaryText(s sync.Summary) string {
+// summaryText renders a summary for humans ("2 in sync, 1 local change").
+func summaryText(s summary) string {
 	var parts []string
 	add := func(n int, one, many string) {
 		if n == 0 {
@@ -174,6 +220,7 @@ func summaryText(s sync.Summary) string {
 	add(s.Pending, "pending", "pending")
 	add(s.Rollback, "rollback", "rollbacks")
 	add(s.Missing, "missing locally", "missing locally")
+	add(s.DeletedInVault, "deleted in the vault (local copy kept)", "deleted in the vault (local copies kept)")
 	if len(parts) == 0 {
 		return "no tracked files"
 	}
@@ -289,7 +336,7 @@ func projectViews(p *sync.Plan, res sync.Resolutions, errs map[sync.ItemKey]erro
 			Missing:     pp.Missing,
 			Unreadable:  pp.Unreadable,
 			DuplicateOf: pp.DuplicateOf,
-			Summary:     toSummaryView(sync.Summarize(pp)),
+			Summary:     toSummaryView(summarize(pp)),
 			Items:       make([]itemView, 0, len(pp.Items)),
 			Warnings:    pp.Warnings,
 		}
@@ -426,12 +473,28 @@ func (c *cli) printReport(p *sync.Plan, res sync.Resolutions, rep *sync.Report) 
 	if len(p.Projects) == 0 {
 		fmt.Fprintln(c.out, "no linked projects (use `private-sync add <path>` or `projects link`)")
 	}
-	fmt.Fprintln(c.out, reportSummary(rep, len(unresolved)))
+	fmt.Fprintln(c.out, reportSummary(rep, len(unresolved), skippedProjects(p)))
 	return nil
 }
 
+// skippedProjects counts the projects Plan could not plan at all (unreadable
+// journal, missing directory): nothing of theirs was applied, so the summary
+// must not claim there was nothing to do.
+func skippedProjects(p *sync.Plan) int {
+	if p == nil {
+		return 0
+	}
+	n := 0
+	for i := range p.Projects {
+		if p.Projects[i].Unreadable || p.Projects[i].Missing {
+			n++
+		}
+	}
+	return n
+}
+
 // reportSummary renders the counters of a report in one line.
-func reportSummary(rep *sync.Report, unresolved int) string {
+func reportSummary(rep *sync.Report, unresolved, skipped int) string {
 	var parts []string
 	add := func(n int, label string) {
 		if n > 0 {
@@ -450,7 +513,13 @@ func reportSummary(rep *sync.Report, unresolved int) string {
 	add(len(rep.Errors), "errors")
 	add(unresolved, "unresolved")
 	if len(parts) == 0 {
+		if skipped > 0 {
+			return fmt.Sprintf("nothing applied (%d project(s) skipped)", skipped)
+		}
 		return "nothing to do"
+	}
+	if skipped > 0 {
+		parts = append(parts, fmt.Sprintf("%d project(s) skipped", skipped))
 	}
 	return strings.Join(parts, ", ")
 }

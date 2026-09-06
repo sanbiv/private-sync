@@ -926,3 +926,82 @@ func TestResolveCommonDir(t *testing.T) {
 }
 
 func ptr(s string) *string { return &s }
+
+// ctxGit is a runner that records the context state of every invocation.
+type ctxGit struct {
+	t     *testing.T
+	tails [][]string
+	ctxs  []error
+	h     func(tail []string) execx.Result
+}
+
+func (r *ctxGit) Run(ctx context.Context, c execx.Cmd) (execx.Result, error) {
+	tail := gitTail(r.t, c)
+	r.tails = append(r.tails, tail)
+	r.ctxs = append(r.ctxs, ctx.Err())
+	res := r.h(tail)
+	if res.ExitCode != 0 {
+		return res, &execx.ExitError{Cmd: c, Result: res}
+	}
+	return res, nil
+}
+
+// TestGitRebaseKilledByCancellationIsAborted: cancelling a Fetch (esc in the
+// TUI) SIGKILLs git, and a signalled process reports exit code -1. That branch
+// used to return without aborting, leaving .git/rebase-merge and a detached
+// HEAD for the next run to commit over. The abort also has to run on a context
+// that is not cancelled, or the process would never start.
+func TestGitRebaseKilledByCancellationIsAborted(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "vault")
+	if err := os.MkdirAll(filepath.Join(dir, ".git"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rec := &ctxGit{t: t}
+	rec.h = func(tail []string) execx.Result {
+		if hasPrefixWords(tail, []string{"rebase"}) && !hasPrefixWords(tail, []string{"rebase", "--abort"}) {
+			cancel() // the user pressed esc while git rebase was running
+			return exit(-1, "signal: killed")
+		}
+		return execx.Result{}
+	}
+	r, err := NewGit(gitCfg("u"), dir, Options{MachineID: "m1", Runner: rec})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Fetch(ctx, testLog(t)); err == nil {
+		t.Fatal("Fetch succeeded although git was killed")
+	}
+	i := -1
+	for n, tail := range rec.tails {
+		if hasPrefixWords(tail, []string{"rebase", "--abort"}) {
+			i = n
+		}
+	}
+	if i < 0 {
+		t.Fatalf("no `git rebase --abort` after the rebase was killed:\n%s", joinTails(rec.tails))
+	}
+	if rec.ctxs[i] != nil {
+		t.Errorf("the abort ran on a cancelled context (%v); the process would never start", rec.ctxs[i])
+	}
+}
+
+func TestUnmergedPaths(t *testing.T) {
+	cases := []struct {
+		in   string
+		want []string
+	}{
+		{"UU shared.txt\n", []string{"shared.txt"}},
+		{"AA both.txt\nDD gone.txt\n", []string{"both.txt", "gone.txt"}},
+		{"AU a\nUD b\nUA c\nDU d\n", []string{"a", "b", "c", "d"}},
+		{" M edited.txt\n?? blobs/\nA  added.txt\n", nil},
+		{"", nil},
+		{"U\n", nil}, // too short to carry a path
+	}
+	for _, tc := range cases {
+		if got := unmergedPaths(tc.in); !slices.Equal(got, tc.want) {
+			t.Errorf("unmergedPaths(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}

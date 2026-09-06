@@ -300,3 +300,78 @@ func TestDashboardStartSyncKeysCallInit(t *testing.T) {
 		})
 	}
 }
+
+// --- regressions -------------------------------------------------------------
+
+// TestDashboardKeepsPartialRowsWhenListingFails is the regression for the
+// dashRowsMsg handler returning before assigning m.rows: computeDashboardRows
+// deliberately returns the linked rows it did build together with the error
+// from listing unlinked vault projects, and dropping them left the user
+// staring at "no projects yet" over a vault full of healthy projects.
+func TestDashboardKeepsPartialRowsWhenListingFails(t *testing.T) {
+	m := &dashboardModel{loading: true}
+	rows := []projectRow{
+		{linked: true, id: "p1", name: "one", badge: "synced"},
+		{linked: true, id: "p2", name: "two", badge: "pending"},
+	}
+
+	m.Update(dashRowsMsg{rows: rows, err: errors.New("list vault projects: permission denied")})
+
+	if len(m.rows) != len(rows) {
+		t.Fatalf("rows = %d, want the %d rows computeDashboardRows did produce", len(m.rows), len(rows))
+	}
+	if m.err == "" {
+		t.Fatalf("the error should still be reported")
+	}
+	if m.loading {
+		t.Fatalf("loading should be cleared")
+	}
+	view := m.View()
+	if !strings.Contains(view, "permission denied") {
+		t.Fatalf("view should show the error banner, got:\n%s", view)
+	}
+	if strings.Contains(view, "no projects yet") {
+		t.Fatalf("view should not fall back to the empty state, got:\n%s", view)
+	}
+	for _, row := range rows {
+		if !strings.Contains(view, row.name) {
+			t.Fatalf("view should list %q, got:\n%s", row.name, view)
+		}
+	}
+}
+
+// TestApplyRunningCoversRekeyBeforeThePush is the regression for ctrl+c being
+// unguarded during the passphrase change itself: settings.sv only exists once
+// the rekey has finished and the push starts, so while Vault.Rekey and the key
+// file rewrite are in flight — the one window where quitting can leave the two
+// out of sync and lock the user out — the first ctrl+c quit immediately.
+func TestApplyRunningCoversRekeyBeforeThePush(t *testing.T) {
+	m := &rootModel{
+		ctx:      context.Background(),
+		screen:   screenSettings,
+		settings: &settingsModel{step: settingsStepRekeying}, // sv still nil
+	}
+	if !m.applyRunning() {
+		t.Fatalf("the rekey window before the push syncView exists must count as busy")
+	}
+
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	rm := next.(*rootModel)
+	if !rm.quitConfirm {
+		t.Fatalf("the first ctrl+c during a rekey should only arm the confirmation")
+	}
+	if cmd != nil {
+		t.Fatalf("the first ctrl+c during a rekey must not quit")
+	}
+
+	// A second press still quits.
+	if _, cmd := rm.Update(tea.KeyMsg{Type: tea.KeyCtrlC}); cmd == nil {
+		t.Fatalf("the second ctrl+c should quit")
+	}
+
+	// Settings screens that are not rekeying stay unguarded.
+	idle := &rootModel{ctx: context.Background(), screen: screenSettings, settings: &settingsModel{step: settingsStepForm}}
+	if idle.applyRunning() {
+		t.Fatalf("an idle settings form must not count as busy")
+	}
+}

@@ -205,7 +205,13 @@ func parseGitConfigRemotes(content string) []string {
 			name := strings.ToLower(section)
 			// [remote "origin"] or the deprecated [remote.origin] form.
 			inRemote = strings.HasPrefix(name, "remote ") || strings.HasPrefix(name, "remote\t") || strings.HasPrefix(name, "remote.")
-			continue
+			// git also accepts a variable on the same line as its section
+			// header: [remote "origin"] url = git@host:a/b.git
+			rest := strings.TrimSpace(line[end+1:])
+			if rest == "" || rest[0] == '#' || rest[0] == ';' {
+				continue
+			}
+			line = rest
 		}
 		if !inRemote {
 			continue

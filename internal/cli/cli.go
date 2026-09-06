@@ -91,7 +91,7 @@ func usagef(format string, a ...any) error { return &usageError{err: fmt.Errorf(
 // terminates the process with the default disposition even while a prompt is
 // still waiting for a line.
 func Main(args []string, fe Frontend) int {
-	keysource.CaptureEnv()
+	captureEnvPassphrase()
 	ctx, stop := interruptContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	return Run(ctx, args, fe, Options{})
@@ -131,11 +131,46 @@ func interruptContextWith(parent context.Context, notify func(chan<- os.Signal, 
 
 // Run is Main with an explicit context and options (embedding, tests).
 func Run(ctx context.Context, args []string, fe Frontend, o Options) int {
-	keysource.CaptureEnv()
+	captureEnvPassphrase()
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	return newCLI(fe, o).run(ctx, args)
+}
+
+// envPassphraseCaptured reports whether keysource.CaptureEnv took the
+// passphrase out of PRIVATE_SYNC_PASSPHRASE in this process. keysource.Obtain
+// prefers that captured value over every configured source, so a rekey that
+// only updates the configured source would lock the user out (spec §11); the
+// commands that rewrap the vault key refuse to run while it is set.
+var (
+	envPassphraseMu   syncpkg.Mutex
+	envPassphraseSeen bool
+)
+
+// captureEnvPassphrase is keysource.CaptureEnv plus the flag above. The
+// variable is unset by CaptureEnv, so the capture has to be observed here.
+func captureEnvPassphrase() {
+	_, ok := os.LookupEnv(keysource.EnvVar)
+	keysource.CaptureEnv()
+	if ok {
+		setEnvPassphraseSeen(true)
+	}
+}
+
+// setEnvPassphraseSeen records (tests: clears) the capture flag.
+func setEnvPassphraseSeen(v bool) {
+	envPassphraseMu.Lock()
+	defer envPassphraseMu.Unlock()
+	envPassphraseSeen = v
+}
+
+// envPassphraseInUse reports whether Obtain would return the captured
+// PRIVATE_SYNC_PASSPHRASE instead of the configured key source.
+func envPassphraseInUse() bool {
+	envPassphraseMu.Lock()
+	defer envPassphraseMu.Unlock()
+	return envPassphraseSeen
 }
 
 // globals holds the parsed global flags.
@@ -147,6 +182,7 @@ type globals struct {
 	noRemote       bool
 	acceptRollback bool
 	json           bool
+	verbose        bool
 }
 
 // strategyValue maps --strategy to the engine strategy: "ask" by default,
@@ -188,6 +224,11 @@ type cli struct {
 	ran bool
 	// remoteFactory is Options.remoteFactory (nil = remote.New).
 	remoteFactory app.RemoteFactory
+	// remoteLog keeps the last remote log lines (git/rclone command lines and
+	// their output) when they are not echoed live: --verbose prints them as
+	// they arrive, otherwise only a remote failure shows the tail.
+	remoteLogMu   syncpkg.Mutex
+	remoteLogTail []string
 	// linked is the project `restore --path` linked in this run; the JSON
 	// report carries it since the text line is not printed with --json.
 	linked *linkView
@@ -281,6 +322,7 @@ the first run).`,
 	pf.BoolVar(&c.g.noRemote, "no-remote", false, "skip fetch and push")
 	pf.BoolVar(&c.g.acceptRollback, "accept-rollback", false, "apply vault versions older than the last synced one")
 	pf.BoolVar(&c.g.json, "json", false, "machine readable output")
+	pf.BoolVarP(&c.g.verbose, "verbose", "v", false, "echo the remote commands (git, rclone) and their output")
 
 	root.AddCommand(
 		c.initCommand(),
@@ -365,9 +407,14 @@ func isTerminal(w io.Writer) bool {
 }
 
 // isInteractive reports whether the front end may take over the terminal:
-// no --yes and stdout is a terminal (or Options.Interactive).
+// no --yes, no --json and stdout is a terminal (or Options.Interactive).
+//
+// --json owns stdout: the conflict resolver renders there (tea.NewProgram
+// defaults to os.Stdout), so a full screen UI would be interleaved with the
+// report. With --json conflicts fall through to the strategy and are reported
+// as unresolved instead (exit 3).
 func (c *cli) isInteractive() bool {
-	if c.g.yes {
+	if c.g.yes || c.g.json {
 		return false
 	}
 	if c.interactive != nil {
@@ -493,8 +540,14 @@ func (c *cli) openSession(ctx context.Context) (*app.Session, error) {
 	return s, nil
 }
 
+// maxRemoteLogTail bounds the remote log lines kept for a failure report.
+const maxRemoteLogTail = 10
+
 // progress prints remote activity (fetch/push) to stderr; apply events are
-// summarised by the report instead.
+// summarised by the report instead. Failures are always reported; the command
+// lines and the remote's own chatter are debugging detail (spec §2.1: the
+// report is the output), so they are only echoed with --verbose and otherwise
+// kept for remoteLogTail, printed when a remote operation fails.
 func (c *cli) progress(ev sync.Event) {
 	if ev.Stage != "fetch" && ev.Stage != "push" {
 		return
@@ -505,7 +558,48 @@ func (c *cli) progress(ev sync.Event) {
 	case ev.Err != nil:
 		fmt.Fprintf(c.errOut, "%s: %v\n", ev.Stage, ev.Err)
 	case ev.Message != "":
-		fmt.Fprintf(c.errOut, "%s: %s\n", ev.Stage, ev.Message)
+		c.remoteLine(ev.Stage, ev.Message)
+	}
+}
+
+// remoteLine echoes one remote log line with --verbose, or keeps it for a
+// later dumpRemoteLog.
+func (c *cli) remoteLine(stage, msg string) {
+	line := stage + ": " + msg
+	if c.g.verbose {
+		fmt.Fprintln(c.errOut, line)
+		return
+	}
+	c.remoteLogMu.Lock()
+	defer c.remoteLogMu.Unlock()
+	c.remoteLogTail = append(c.remoteLogTail, line)
+	if n := len(c.remoteLogTail); n > maxRemoteLogTail {
+		c.remoteLogTail = append([]string(nil), c.remoteLogTail[n-maxRemoteLogTail:]...)
+	}
+}
+
+// remoteLogger is remoteLine bound to one stage (commands that drive the
+// remote themselves instead of going through the engine).
+func (c *cli) remoteLogger(stage string) func(string) {
+	return func(line string) { c.remoteLine(stage, line) }
+}
+
+// dumpRemoteLog prints the kept remote log lines after a remote failure, so
+// the error has the context --verbose would have shown live.
+func (c *cli) dumpRemoteLog() {
+	if c.g.verbose {
+		return // already echoed as they arrived
+	}
+	c.remoteLogMu.Lock()
+	lines := c.remoteLogTail
+	c.remoteLogTail = nil
+	c.remoteLogMu.Unlock()
+	if len(lines) == 0 {
+		return
+	}
+	fmt.Fprintf(c.errOut, "last %d remote log line(s) (run again with --verbose for all of them):\n", len(lines))
+	for _, l := range lines {
+		fmt.Fprintln(c.errOut, "  "+l)
 	}
 }
 
@@ -520,6 +614,7 @@ func (c *cli) fetch(ctx context.Context, s *app.Session) error {
 			return ctxErr
 		}
 		c.warn(fmt.Sprintf("fetch failed: %v (continuing with the local vault copy)", err))
+		c.dumpRemoteLog()
 	}
 	return nil
 }
@@ -530,6 +625,7 @@ func (c *cli) push(ctx context.Context, s *app.Session) error {
 		return nil
 	}
 	if err := s.Engine.Push(ctx, c.progress); err != nil {
+		c.dumpRemoteLog()
 		return fmt.Errorf("push: %w", err)
 	}
 	return nil

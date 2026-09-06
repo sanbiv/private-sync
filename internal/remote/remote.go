@@ -31,6 +31,13 @@ type Options struct {
 	Runner      execx.Runner
 }
 
+const (
+	// vaultFileName is the vault descriptor at the root of the vault (§10.1).
+	vaultFileName = "vault.json"
+	// blobsDirName is the content-addressed blob store inside the vault.
+	blobsDirName = "blobs"
+)
+
 // ErrUnsupported is returned for unknown remote types.
 var ErrUnsupported = errors.New("unsupported remote type")
 

@@ -127,7 +127,18 @@ func (m *rootModel) applyRunning() bool {
 	case screenAddProject:
 		return m.add != nil && m.add.step == stepApply && applying(m.add.apply)
 	case screenSettings:
-		return m.settings != nil && m.settings.step == settingsStepRekeying && applying(m.settings.sv)
+		if m.settings == nil || m.settings.step != settingsStepRekeying {
+			return false
+		}
+		// settings.sv only exists once the rekey itself has finished and the
+		// follow-up push starts. Before that, the rekey goroutine is in the
+		// middle of rewrapping vault.json and rewriting the key file — the
+		// one window where an unconfirmed ctrl+c can leave the two out of
+		// sync and lock the user out — so treat it as busy too.
+		if m.settings.sv == nil {
+			return true
+		}
+		return applying(m.settings.sv)
 	}
 	return false
 }
@@ -420,13 +431,17 @@ func (m *dashboardModel) Update(msg tea.Msg) (dashAction, tea.Cmd) {
 	switch msg := msg.(type) {
 	case dashRowsMsg:
 		m.loading = false
-		if msg.err != nil {
-			m.err = msg.err.Error()
-			return dashAction{}, nil
-		}
+		// computeDashboardRows deliberately returns the rows it did build
+		// alongside its error (listing unlinked vault projects can fail while
+		// every linked project is fine): keep them and show the error as a
+		// banner above, instead of dropping the whole list and rendering the
+		// "no projects yet" empty state over a perfectly usable vault.
 		m.rows = msg.rows
 		if m.cursor >= len(m.rows) {
 			m.cursor = 0
+		}
+		if msg.err != nil {
+			m.err = msg.err.Error()
 		}
 		return dashAction{}, nil
 	case linkDoneMsg:

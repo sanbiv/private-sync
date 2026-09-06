@@ -676,3 +676,145 @@ func TestGitNeverRunsAskpass(t *testing.T) {
 		t.Errorf("log leaks helper output: %v", lines)
 	}
 }
+
+// TestGitPrepareRefusesForeignRepository guards against adopting a git
+// repository that is not the vault's. Pointing setup at a project directory
+// used to repoint that project's origin at the vault remote and then commit
+// and push its whole working tree -- including uncommitted work and whatever
+// secrets it holds -- to the sync remote in plaintext.
+func TestGitPrepareRefusesForeignRepository(t *testing.T) {
+	requireGit(t)
+	ctx := context.Background()
+	vaultRemote := newBare(t)
+	userOrigin := newBare(t)
+
+	dir := filepath.Join(t.TempDir(), "myapp")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	rawGit(t, dir, "init", "-q", "-b", "main")
+	rawGit(t, dir, "remote", "add", "origin", userOrigin)
+	mustWrite(t, dir, "README.md", "# myapp\n")
+	rawGit(t, dir, "add", "README.md")
+	rawGit(t, dir, "commit", "-qm", "init")
+	mustWrite(t, dir, "secret-draft.txt", "AWS_SECRET=hunter2\n") // uncommitted WIP
+
+	r, err := NewGit(gitCfg(vaultRemote), dir, Options{MachineID: "m1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = r.Prepare(ctx, testLog(t))
+	if err == nil {
+		t.Fatal("Prepare adopted a repository that is not the vault's")
+	}
+	for _, want := range []string{dir, "not this vault's", "README.md", userOrigin} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q lacks %q", err, want)
+		}
+	}
+	if got := rawGit(t, dir, "remote", "get-url", "origin"); got != userOrigin {
+		t.Errorf("origin repointed to %q, want %q", got, userOrigin)
+	}
+	if refs := rawGit(t, vaultRemote, "for-each-ref"); refs != "" {
+		t.Errorf("the project was published to the vault remote:\n%s", refs)
+	}
+	if got := rawGit(t, dir, "status", "--porcelain"); !strings.Contains(got, "secret-draft.txt") {
+		t.Errorf("uncommitted work was committed: %q", got)
+	}
+}
+
+// TestGitPrepareAdoptsInterruptedVault: a vault whose first Prepare died
+// before origin was set is still adopted -- only foreign content is refused.
+func TestGitPrepareAdoptsInterruptedVault(t *testing.T) {
+	requireGit(t)
+	ctx := context.Background()
+	bare := newBare(t)
+	dir := filepath.Join(t.TempDir(), "vault")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	rawGit(t, dir, "init", "-q")
+	rawGit(t, dir, "remote", "add", "origin", "/nonexistent/old.git")
+	mustWrite(t, dir, "vault.json", vaultJSONv1)
+	mustWrite(t, dir, "machines/m1.json.enc", "me")
+	mustWrite(t, dir, "blobs/aa/one.enc", "one")
+	mustWrite(t, dir, ".psv-tmp-leftover", "junk")
+
+	r, err := NewGit(gitCfg(bare), dir, Options{MachineID: "m1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Prepare(ctx, testLog(t)); err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	if got := rawGit(t, dir, "remote", "get-url", "origin"); got != bare {
+		t.Errorf("origin = %q, want %q", got, bare)
+	}
+}
+
+// TestGitFetchAbortsInterruptedRebase: a rebase interrupted by a cancelled
+// Fetch (git is SIGKILLed and leaves .git/rebase-merge behind with a detached
+// HEAD) must be aborted by the next run before anything is committed.
+// Committing that tree used to write conflict markers into the vault, and the
+// abort that followed silently deleted vault files created since.
+func TestGitFetchAbortsInterruptedRebase(t *testing.T) {
+	requireGit(t)
+	ctx := context.Background()
+	a, adir, b, bdir := twoSyncedVaults(t)
+
+	mustWrite(t, adir, "shared.txt", "from A\n")
+	if err := a.Push(ctx, []string{"shared.txt"}, testLog(t)); err != nil {
+		t.Fatal(err)
+	}
+	// B commits conflicting content and is stopped in the middle of a rebase,
+	// exactly where a killed `git rebase` leaves it.
+	mustWrite(t, bdir, "shared.txt", "from B\n")
+	rawGit(t, bdir, "add", "-A")
+	rawGit(t, bdir, "commit", "-qm", "local")
+	rawGit(t, bdir, "fetch", "origin")
+	if out, err := tryGit(t, bdir, "rebase", "refs/remotes/origin/main"); err == nil {
+		t.Fatalf("the setup rebase did not conflict:\n%s", out)
+	}
+	if !pathExists(bdir, ".git/rebase-merge") {
+		t.Fatal("setup did not leave the repository mid-rebase")
+	}
+	// A new vault file appears before the next sync.
+	mustWrite(t, bdir, "blobs/de/deadbeef.enc", "NEWBLOB")
+
+	err := b.Fetch(ctx, testLog(t))
+	if err == nil {
+		t.Fatal("Fetch succeeded despite the conflicting histories")
+	}
+	if !pathExists(bdir, "blobs/de/deadbeef.enc") {
+		t.Error("the new blob was deleted by the abort of a bogus commit")
+	}
+	var rc *RebaseConflictError
+	if !errors.As(err, &rc) {
+		t.Errorf("error is %T (%v), want *RebaseConflictError", err, err)
+	}
+	if got := mustRead(t, bdir, "shared.txt"); strings.Contains(got, "<<<<<<<") {
+		t.Errorf("conflict markers left in the working tree: %q", got)
+	}
+	if got := rawGit(t, bdir, "symbolic-ref", "HEAD"); got != "refs/heads/main" {
+		t.Errorf("HEAD = %q, want refs/heads/main", got)
+	}
+	if pathExists(bdir, ".git/rebase-merge") || pathExists(bdir, ".git/rebase-apply") {
+		t.Error("repository still mid-rebase after Fetch")
+	}
+	for _, f := range lsFiles(t, bdir) {
+		if strings.Contains(mustRead(t, bdir, f), "<<<<<<<") {
+			t.Errorf("committed conflict markers in %s", f)
+		}
+	}
+}
+
+// tryGit runs git like rawGit but returns the failure instead of failing.
+func tryGit(t *testing.T, dir string, args ...string) (string, error) {
+	t.Helper()
+	full := append([]string{"-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=" + os.DevNull}, args...)
+	cmd := exec.Command("git", full...)
+	cmd.Dir = dir
+	cmd.Env = cleanGitEnv()
+	outb, err := cmd.CombinedOutput()
+	return string(outb), err
+}
