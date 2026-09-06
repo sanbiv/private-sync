@@ -8,6 +8,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 
@@ -156,7 +157,7 @@ func (e *Engine) planProject(pc config.ProjectConfig, opts Options) ProjectPlan 
 			continue
 		}
 		pp.journalSeqs[mid] = j.Seq
-		if stored := e.store.JournalSeq(mid); stored > j.Seq {
+		if stored := e.store.JournalSeq(seqKey(pc.ID, mid)); stored > j.Seq {
 			pl.rolled[mid] = true
 			pp.Warnings = append(pp.Warnings, fmt.Sprintf("journal of %s rolled back (seq %d, previously seen %d)", mid, j.Seq, stored))
 		}
@@ -375,6 +376,10 @@ func (pl *planner) decide(p string, local *FileRef, localText []byte, base *File
 			if base != nil && base.Kind == vault.KindDeleted {
 				return it, false
 			}
+			// Spec: "converge base := tombstone (no item)". The item exists
+			// so Apply records the tombstone base; nothing the user can see
+			// changes, so Summarize counts it as in sync, not as a remote
+			// change (Report still counts it under Converged).
 			it.Action = ActionConverge
 			it.Reason = "deleted in the vault and absent locally: recording the deletion"
 			return pl.finish(it, note)
@@ -401,6 +406,11 @@ func (pl *planner) decide(p string, local *FileRef, localText []byte, base *File
 		case base.Kind == vault.KindFile && local.Blob == base.Blob: // row 6
 			it.Action = ActionTrashLocal
 			it.Reason = "deleted in the vault, unchanged locally: moving the local copy to the trash"
+			// A tombstone that does not dominate the file this machine last
+			// converged to is as suspect as an older file version (a journal
+			// replaced by an older copy): report it like the downloads do
+			// instead of trashing an unchanged local copy.
+			pl.rollbackCheck(&it, base, h)
 		default: // row 7
 			it.Action = ActionConflict
 			it.Conflict = ConflictModifyDelete
@@ -412,7 +422,7 @@ func (pl *planner) decide(p string, local *FileRef, localText []byte, base *File
 
 	// Rows 10-14: file head (single or synthetic).
 	if restore {
-		if local != nil && local.Blob == h.Blob && h.Mode != 0 && local.Mode != h.Mode&uint32(fs.ModePerm) {
+		if local != nil && local.Blob == h.Blob && modeDiffers(local.Mode, h.Mode) {
 			// Same bytes, different mode: restore reapplies the recorded mode
 			// (spec §13); download() only chmods when the content matches.
 			if !pl.loadHeadText(&it) {
@@ -593,6 +603,33 @@ func (pl *planner) tooLarge(it Item, base *FileRef, single *vault.Entry, hasHead
 		return report(ActionUpload, "vault unchanged, local changes (if any) cannot be uploaded")
 	}
 	return report(ActionDownload, "modified in the vault, local copy cannot be compared or replaced")
+}
+
+// modeDiffers reports whether the recorded head mode should be reapplied to a
+// local file whose content already matches (restore, and download's
+// mode-only reconciliation). A head without a recorded mode never differs.
+func modeDiffers(local, head uint32) bool {
+	return modeDiffersOn(runtime.GOOS, local, head)
+}
+
+// modeDiffersOn is modeDiffers for a given GOOS. On Windows os.FileInfo only
+// ever reports 0666 or 0444 and os.Chmod only toggles the read-only
+// attribute, so a mode recorded on a Unix machine (0600, 0644, ...) would
+// never match and every restore would re-plan a phantom download forever:
+// there only the owner-write bit (0200) is compared. Elsewhere the full
+// permission bits are compared.
+func modeDiffersOn(goos string, local, head uint32) bool {
+	perm := uint32(fs.ModePerm)
+	head &= perm
+	if head == 0 {
+		return false
+	}
+	local &= perm
+	if goos == "windows" {
+		const ownerWrite = 0o200
+		return local&ownerWrite != head&ownerWrite
+	}
+	return local != head
 }
 
 // plural picks the singular or plural noun.

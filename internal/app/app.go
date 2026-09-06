@@ -37,6 +37,10 @@ var ErrVaultRace = errors.New("another machine created the vault first; re-run i
 // ErrNotLinked is returned when a project id or name is not mapped on this machine.
 var ErrNotLinked = errors.New("project is not linked on this machine")
 
+// ErrAmbiguousProject is returned by ResolveProject when a name matches more
+// than one linked project (ids are the only identity; names may repeat).
+var ErrAmbiguousProject = errors.New("ambiguous project name")
+
 // ErrKeyFileMissing is returned by Setup when the vault already exists, the
 // key source is a file and that file does not exist: only the user knows the
 // existing vault's passphrase, so the file is never generated in that case.
@@ -206,6 +210,10 @@ func (a *App) Setup(ctx context.Context, p ui.Prompter, log func(string)) (*Sess
 	if err != nil {
 		return nil, err
 	}
+	// Whether Prepare is about to create the git repository (as opposed to
+	// finding one): a repository this run created may be discarded again when
+	// the creation protocol fails (see setupCreate).
+	hadGit := exists(filepath.Join(vaultDir, gitDirName))
 	log(fmt.Sprintf("preparing remote %s", rem.Name()))
 	if err := rem.Prepare(ctx, log); err != nil {
 		return nil, fmt.Errorf("prepare remote %s: %w", rem.Name(), err)
@@ -218,7 +226,16 @@ func (a *App) Setup(ctx context.Context, p ui.Prompter, log func(string)) (*Sess
 	if vault.Exists(vaultDir) {
 		return a.setupOpen(ctx, p, log, rem, vaultDir)
 	}
-	return a.setupCreate(ctx, p, log, rem, vaultDir)
+	return a.setupCreate(ctx, p, log, rem, vaultDir, hadGit)
+}
+
+// gitDirName is the repository directory the git backend creates in the vault.
+const gitDirName = ".git"
+
+// exists reports whether path exists (any type, symlinks not followed).
+func exists(path string) bool {
+	_, err := os.Lstat(path)
+	return err == nil
 }
 
 // setupOpen is the "vault.json exists ⇒ open is the only option" branch of §10.1.
@@ -257,7 +274,11 @@ func (a *App) setupOpen(ctx context.Context, p ui.Prompter, log func(string), re
 }
 
 // setupCreate is the "no vault.json ⇒ create, push, fetch, verify, pin" branch of §10.1.
-func (a *App) setupCreate(ctx context.Context, p ui.Prompter, log func(string), rem remote.Remote, vaultDir string) (*Session, error) {
+//
+// hadGit reports whether <vaultDir>/.git existed before Prepare ran: when it
+// did not, the git backend created it during this run, and a failed creation
+// discards it again (see discardLocalHistory).
+func (a *App) setupCreate(ctx context.Context, p ui.Prompter, log func(string), rem remote.Remote, vaultDir string, hadGit bool) (*Session, error) {
 	// A pin for this path whose vault.json is gone is exactly what the pin
 	// exists to catch (dehydrated Drive folder, not-yet-synced clone, wrong
 	// path): never replace it silently.
@@ -349,6 +370,9 @@ func (a *App) setupCreate(ctx context.Context, p ui.Prompter, log func(string), 
 		v.Close()
 		removeLocalVault(vaultDir, id, written, log)
 		discardKeyFile()
+		if a.Config.Vault.Remote.Type == config.RemoteGit {
+			err = discardLocalHistory(vaultDir, hadGit, err, log)
+		}
 		return nil, err
 	}
 	if err := v.WriteMachine(a.machineInfo()); err != nil {
@@ -399,6 +423,40 @@ func isVaultRace(err error) bool {
 	var rc *remote.RebaseConflictError
 	return errors.As(err, &rc) && rc != nil && slices.Contains(rc.Files, vault.VaultFileName)
 }
+
+// discardLocalHistory undoes the git repository a failed creation leaves
+// behind. The git backend commits vault.json locally before pushing, so after
+// a lost race (or any failure once another machine's vault reached the remote)
+// the next Prepare would replay that commit onto the winner's history and hit
+// an add/add conflict on vault.json on every re-run of init. When this run
+// created <vaultDir>/.git it is removed, so the next Prepare re-initialises
+// the repository and adopts origin/<branch>. A repository that existed before
+// (it may carry history that is not ours) is kept, and a race error then
+// names the directory to move aside so "re-run init" can succeed.
+func discardLocalHistory(vaultDir string, hadGit bool, err error, log func(string)) error {
+	if log == nil {
+		log = discard
+	}
+	gitDir := filepath.Join(vaultDir, gitDirName)
+	if hadGit {
+		if isVaultRaceErr(err) {
+			return fmt.Errorf("%w; if init keeps failing with a vault.json conflict, move %s aside (it keeps the git history of this failed creation) and re-run init", err, vaultDir)
+		}
+		return err
+	}
+	if !exists(gitDir) {
+		return err
+	}
+	if rmErr := os.RemoveAll(gitDir); rmErr != nil {
+		log(fmt.Sprintf("warning: could not remove %s after failed vault creation: %v", gitDir, rmErr))
+		return fmt.Errorf("%w; remove %s (the git history of this failed creation) before re-running init", err, gitDir)
+	}
+	log(fmt.Sprintf("removed %s (git history of a vault creation that did not complete)", gitDir))
+	return err
+}
+
+// isVaultRaceErr reports whether err is (or wraps) ErrVaultRace.
+func isVaultRaceErr(err error) bool { return errors.Is(err, ErrVaultRace) }
 
 // removeLocalVault deletes the files a failed creation wrote below vaultDir
 // (vault.json and this machine's own files). vault.json is only removed while
@@ -785,6 +843,15 @@ func (s *Session) LinkProject(ctx context.Context, id, name, dir string, fps []i
 		return fmt.Errorf("project directory %s: %w", dir, err)
 	}
 	absDir = filepath.Clean(absDir)
+	// A typo'd path must fail here, not surface later as "path missing"
+	// during sync after it was already written to the config.
+	fi, err := os.Stat(absDir)
+	if err != nil {
+		return fmt.Errorf("project directory %s: %w", absDir, err)
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("project directory %s: not a directory", absDir)
+	}
 
 	existing, warnings, err := s.Vault.ReadProject(id)
 	s.warn(warnings)
@@ -852,6 +919,12 @@ func (s *Session) UnlinkProject(id string) error {
 }
 
 // ResolveProject finds a linked project by id or name.
+//
+// An exact id match always wins. Otherwise the name is compared
+// case-insensitively with the configured names and with the vault names of
+// the linked projects; a name shared by several linked projects is reported
+// as ErrAmbiguousProject (listing the candidate ids) rather than resolved to
+// whichever comes first in the config.
 func (s *Session) ResolveProject(idOrName string) (*config.ProjectConfig, error) {
 	if err := s.check(); err != nil {
 		return nil, err
@@ -860,8 +933,25 @@ func (s *Session) ResolveProject(idOrName string) (*config.ProjectConfig, error)
 	if idOrName == "" {
 		return nil, errors.New("app.ResolveProject: empty project id or name")
 	}
-	if p, ok := s.Config.Project(idOrName); ok {
-		return p, nil
+	cfg := s.Config
+	for i := range cfg.Projects {
+		if cfg.Projects[i].ID == idOrName {
+			return &cfg.Projects[i], nil
+		}
+	}
+	// Candidate ids in config order, without duplicates.
+	var candidates []string
+	seen := map[string]bool{}
+	add := func(id string) {
+		if id != "" && !seen[id] {
+			seen[id] = true
+			candidates = append(candidates, id)
+		}
+	}
+	for i := range cfg.Projects {
+		if p := &cfg.Projects[i]; p.Name != "" && strings.EqualFold(p.Name, idOrName) {
+			add(p.ID)
+		}
 	}
 	projects, err := s.listProjects()
 	if err != nil {
@@ -869,14 +959,23 @@ func (s *Session) ResolveProject(idOrName string) (*config.ProjectConfig, error)
 	}
 	linked := s.linkedIDs()
 	for _, vp := range projects {
-		if !linked[vp.ID] || !strings.EqualFold(vp.Name, idOrName) {
-			continue
-		}
-		if p, ok := s.Config.Project(vp.ID); ok {
-			return p, nil
+		if linked[vp.ID] && vp.Name != "" && strings.EqualFold(vp.Name, idOrName) {
+			add(vp.ID)
 		}
 	}
-	return nil, fmt.Errorf("%w: %q", ErrNotLinked, idOrName)
+	switch len(candidates) {
+	case 0:
+		return nil, fmt.Errorf("%w: %q", ErrNotLinked, idOrName)
+	case 1:
+		for i := range cfg.Projects {
+			if cfg.Projects[i].ID == candidates[0] {
+				return &cfg.Projects[i], nil
+			}
+		}
+		return nil, fmt.Errorf("%w: %q", ErrNotLinked, idOrName)
+	default:
+		return nil, fmt.Errorf("%w: %q matches projects %s; use the project id", ErrAmbiguousProject, idOrName, strings.Join(candidates, ", "))
+	}
 }
 
 // UnlinkedProjects lists vault projects not mapped on this machine.

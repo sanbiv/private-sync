@@ -62,6 +62,20 @@ func writeIndex(t *testing.T, s *Store, entries []TrashEntry) {
 	}
 }
 
+// mustPut is TrashPut that fails the test on error, so a failing put surfaces
+// as a readable assertion instead of an index-out-of-range on e.Blob[:2].
+func mustPut(t *testing.T, s *Store, k *crypto.Keys, project, path string, content []byte, mode uint32) TrashEntry {
+	t.Helper()
+	e, err := s.TrashPut(k, project, path, content, mode)
+	if err != nil {
+		t.Fatalf("TrashPut(%s/%s): %v", project, path, err)
+	}
+	if len(e.Blob) < 2 {
+		t.Fatalf("TrashPut(%s/%s): short blob id %q", project, path, e.Blob)
+	}
+	return e
+}
+
 // --- machine.json -----------------------------------------------------------
 
 func TestLoadMachineCreatesOnceAndIsStable(t *testing.T) {
@@ -156,7 +170,7 @@ func TestLoadMachineErrors(t *testing.T) {
 
 func TestLoadMachinePreservesPins(t *testing.T) {
 	stateDir := t.TempDir()
-	if err := PinVault(stateDir, "/vaults/a", "vault-a"); err != nil {
+	if err := PinVault(stateDir, absPath(t, "vaults", "a"), "vault-a"); err != nil {
 		t.Fatal(err)
 	}
 	m, err := LoadMachine(stateDir)
@@ -166,7 +180,7 @@ func TestLoadMachinePreservesPins(t *testing.T) {
 	if m.ID == "" {
 		t.Fatal("empty machine id after PinVault-first flow")
 	}
-	id, ok, err := PinnedVault(stateDir, "/vaults/a")
+	id, ok, err := PinnedVault(stateDir, absPath(t, "vaults", "a"))
 	if err != nil || !ok || id != "vault-a" {
 		t.Fatalf("pin lost after LoadMachine: id=%q ok=%v err=%v", id, ok, err)
 	}
@@ -174,7 +188,8 @@ func TestLoadMachinePreservesPins(t *testing.T) {
 
 func TestPinUnpin(t *testing.T) {
 	stateDir := t.TempDir()
-	vp := filepath.Join(string(filepath.Separator), "home", "me", "vault")
+	vp := absPath(t, "home", "me", "vault") // absolute on every platform (drive letter on Windows)
+	other := absPath(t, "another", "vault")
 
 	// Nothing pinned yet (no machine.json at all).
 	id, ok, err := PinnedVault(stateDir, vp)
@@ -207,7 +222,7 @@ func TestPinUnpin(t *testing.T) {
 
 	// Machine id survives pinning.
 	m1, _ := LoadMachine(stateDir)
-	if err := PinVault(stateDir, "/another/vault", "v2"); err != nil {
+	if err := PinVault(stateDir, other, "v2"); err != nil {
 		t.Fatal(err)
 	}
 	m2, _ := LoadMachine(stateDir)
@@ -231,7 +246,7 @@ func TestPinUnpin(t *testing.T) {
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		t.Fatal(err)
 	}
-	if doc.Vaults[vp] != "v1b" || doc.Vaults["/another/vault"] != "v2" {
+	if doc.Vaults[vp] != "v1b" || doc.Vaults[other] != "v2" {
 		t.Errorf("vaults map = %v", doc.Vaults)
 	}
 
@@ -242,13 +257,13 @@ func TestPinUnpin(t *testing.T) {
 	if _, ok, _ := PinnedVault(stateDir, vp); ok {
 		t.Error("still pinned after UnpinVault")
 	}
-	if id, ok, _ := PinnedVault(stateDir, "/another/vault"); !ok || id != "v2" {
+	if id, ok, _ := PinnedVault(stateDir, other); !ok || id != "v2" {
 		t.Error("UnpinVault removed an unrelated pin")
 	}
-	if err := UnpinVault(stateDir, "/never/pinned"); err != nil {
+	if err := UnpinVault(stateDir, absPath(t, "never", "pinned")); err != nil {
 		t.Errorf("UnpinVault unknown path: %v", err)
 	}
-	if err := UnpinVault(t.TempDir(), "/x"); err != nil {
+	if err := UnpinVault(t.TempDir(), absPath(t, "x")); err != nil {
 		t.Errorf("UnpinVault on fresh dir: %v", err)
 	}
 
@@ -269,7 +284,7 @@ func TestPinUnpin(t *testing.T) {
 
 func TestCheckPin(t *testing.T) {
 	stateDir := t.TempDir()
-	vp := "/v/one"
+	vp := absPath(t, "v", "one")
 	if err := CheckPin(stateDir, vp, "id-1"); err != nil {
 		t.Fatalf("CheckPin first: %v", err)
 	}
@@ -293,10 +308,10 @@ func TestPinnedVaultCorruptFile(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(stateDir, "machine.json"), []byte("nope"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := PinnedVault(stateDir, "/v"); err == nil {
+	if _, _, err := PinnedVault(stateDir, absPath(t, "v")); err == nil {
 		t.Error("PinnedVault on corrupt file: want error")
 	}
-	if err := PinVault(stateDir, "/v", "x"); err == nil {
+	if err := PinVault(stateDir, absPath(t, "v"), "x"); err == nil {
 		t.Error("PinVault on corrupt file: want error")
 	}
 }
@@ -743,11 +758,11 @@ func TestTrashPurge(t *testing.T) {
 	oldOnly := []byte("old only\n")
 	fresh := []byte("fresh\n")
 
-	eOldShared, _ := s.TrashPut(k, "p", "s1", shared, 0o600)
-	eNewShared, _ := s.TrashPut(k, "p", "s2", shared, 0o600)
-	eOld, _ := s.TrashPut(k, "p", "o", oldOnly, 0o600)
-	eOld2, _ := s.TrashPut(k, "p", "o2", oldOnly, 0o600) // same blob, also old
-	eFresh, _ := s.TrashPut(k, "p", "f", fresh, 0o600)
+	eOldShared := mustPut(t, s, k, "p", "s1", shared, 0o600)
+	eNewShared := mustPut(t, s, k, "p", "s2", shared, 0o600)
+	eOld := mustPut(t, s, k, "p", "o", oldOnly, 0o600)
+	eOld2 := mustPut(t, s, k, "p", "o2", oldOnly, 0o600) // same blob, also old
+	eFresh := mustPut(t, s, k, "p", "f", fresh, 0o600)
 
 	// Backdate.
 	entries := readIndex(t, s)
@@ -795,11 +810,11 @@ func TestTrashPurge(t *testing.T) {
 	if _, err := os.Stat(blobPath(eOld)); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("unreferenced blob still present: %v", err)
 	}
-	if _, err := os.Stat(filepath.Dir(blobPath(eOld))); !errors.Is(err, fs.ErrNotExist) {
-		// The shard dir may legitimately survive if another blob shares its prefix.
-		if eOld.Blob[:2] != eFresh.Blob[:2] && eOld.Blob[:2] != eNewShared.Blob[:2] {
-			t.Errorf("empty shard dir left behind: %v", err)
-		}
+	// The shard directory is deliberately left in place (removing it could
+	// race a concurrent TrashPut in another process); it must still be a
+	// usable directory, empty or not.
+	if st, err := os.Stat(filepath.Dir(blobPath(eOld))); err != nil || !st.IsDir() {
+		t.Errorf("shard dir of purged blob: %v", err)
 	}
 	if _, err := os.Stat(blobPath(eNewShared)); err != nil {
 		t.Errorf("shared blob deleted although still referenced: %v", err)
@@ -856,7 +871,7 @@ func TestTrashPurgeMissingBlobFile(t *testing.T) {
 		t.Errorf("purge with missing blob: n=%d err=%v", n, err)
 	}
 	// Reading an entry whose blob is missing is an error, not a panic.
-	e2, _ := s.TrashPut(k, "p", "y", []byte("y"), 0o600)
+	e2 := mustPut(t, s, k, "p", "y", []byte("y"), 0o600)
 	_ = os.Remove(filepath.Join(s.Dir(), "trash", e2.Blob[:2], e2.Blob+".enc"))
 	if _, _, err := s.TrashRead(k, e2.ID); err == nil {
 		t.Error("TrashRead with missing blob file: want error")

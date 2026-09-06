@@ -567,8 +567,12 @@ func TestClose(t *testing.T) {
 
 func TestBlobPath(t *testing.T) {
 	tests := []struct{ id, want string }{
-		{"abcdef0123", "blobs/ab/abcdef0123.enc"},
-		{"ab", "blobs/ab/ab.enc"},
+		{strings.Repeat("ab", 32), "blobs/ab/" + strings.Repeat("ab", 32) + ".enc"},
+		{"0123456789abcdef" + strings.Repeat("f", 48), "blobs/01/0123456789abcdef" + strings.Repeat("f", 48) + ".enc"},
+		{"abcdef0123", ""}, // real ids are exactly 64 hex characters
+		{"ab", ""},
+		{strings.Repeat("a", 63), ""},
+		{strings.Repeat("a", 65), ""},
 		{"a", ""},
 		{"", ""},
 		{"ABCDEF", ""},
@@ -1561,8 +1565,8 @@ func TestResolveHeads(t *testing.T) {
 				{mB, KindFile, "same", Clock{mA: 1, mB: 1}, nil, t2},
 			},
 			wantEntry:   true,
-			wantMachine: mA, wantKind: KindFile, wantBlob: "same",
-			wantCands: []string{mA},
+			wantMachine: mB, wantKind: KindFile, wantBlob: "same", // latest UpdatedAt
+			wantCands: []string{mA, mB}, // one per machine, never collapsed
 		},
 		{
 			name: "equal clocks different content: concurrent",
@@ -1625,7 +1629,7 @@ func TestResolveHeads(t *testing.T) {
 			},
 			wantEntry:   true,
 			wantMachine: mA, wantKind: KindFile, wantBlob: "same",
-			wantCands: []string{mA},
+			wantCands: []string{mA, mB}, // one per machine, never collapsed
 		},
 	}
 	for _, tc := range tests {
@@ -1707,8 +1711,8 @@ func TestResolveHeadsMultiplePathsAndFillIns(t *testing.T) {
 	if h := heads["gone"]; h.Entry == nil || h.Entry.Kind != KindDeleted {
 		t.Errorf("gone: %+v", h)
 	}
-	if h := heads["shared"]; h.Entry == nil || len(h.Candidates) != 1 {
-		t.Errorf("shared (equal clocks, same content): %+v", h)
+	if h := heads["shared"]; h.Entry == nil || len(h.Candidates) != 2 {
+		t.Errorf("shared (equal clocks, same content): %+v, want a single head with one candidate per machine", h)
 	}
 	if h := heads["b.txt"]; h.Entry == nil || h.Entry.Machine != mB {
 		t.Errorf("b.txt: %+v", h)

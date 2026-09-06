@@ -156,7 +156,9 @@ func diffContent(it *sync.Item) string {
 	case it.Conflict == sync.ConflictModifyDelete:
 		return "Deleted in the vault, but present locally with different content.\n\nl = keep (re-upload)   r = delete (trash the local copy)"
 	case it.Merge != nil && it.Merge.Clean:
-		return styles.Success.Render("Clean automatic merge — press m to use it:") + "\n\n" + string(it.Merge.Merged)
+		diff := renderDiff(merge.LineDiff(it.LocalText, it.HeadText))
+		preview := styles.Success.Render("Clean automatic merge — press m to use it:") + "\n\n" + string(it.Merge.Merged)
+		return diff + "\n" + styles.Muted.Render(strings.Repeat("─", 40)) + "\n\n" + preview
 	case it.Merge != nil && it.Merge.Kind == merge.KindBinary:
 		return fmt.Sprintf("Binary conflict: local %d bytes, vault %d bytes. Choose l or r.", len(it.LocalText), len(it.HeadText))
 	case it.Merge != nil:
@@ -324,10 +326,15 @@ func (m *Resolver) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.msg = "no single remote version to take"
 		return m, nil
 	case "k":
-		if it.Merge != nil && it.Merge.Kind == merge.KindDotenv && !it.Merge.Clean {
+		if it.Merge != nil && it.Merge.Kind == merge.KindDotenv && !it.Merge.Clean && len(it.Merge.Hunks) > 0 {
 			m.dotenv = newDotenvState(it.Merge)
 			m.msg = ""
 		} else {
+			// The len(Hunks) > 0 guard also covers a dotenv Result with
+			// Clean=false but zero Hunks (conflicting non-dotenv sections of
+			// an otherwise dotenv-shaped file): without it, newDotenvState
+			// would build a dotenvState with an empty hunks slice and "l"/"r"
+			// in updateDotenv would index ds.hunks[ds.cursor] out of bounds.
 			m.msg = "per-key resolution is only available for dotenv conflicts"
 		}
 		return m, nil

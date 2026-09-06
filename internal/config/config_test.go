@@ -845,6 +845,32 @@ func TestIsWithinCase(t *testing.T) {
 	if w := c.Warnings(); len(w) != 1 || !strings.Contains(w[0], "inside project myapp") {
 		t.Errorf("Warnings = %v, want key-inside-project warning for a case-variant path", w)
 	}
+	// Two projects whose paths differ only by case are one directory here.
+	c = valid()
+	c.Projects[1] = ProjectConfig{ID: "bbbb000011112222", Name: "twin", Path: "~/work/MYAPP"}
+	if w := c.Warnings(); len(w) != 1 || !strings.Contains(w[0], "map to the same path") {
+		t.Errorf("Warnings = %v, want same-path warning for case-variant project paths", w)
+	}
+}
+
+func TestWarningsDuplicatePathsExactCase(t *testing.T) {
+	setHome(t)
+	c := valid()
+	c.Projects[1] = ProjectConfig{ID: "bbbb000011112222", Name: "twin", Path: "~/Work/myapp"}
+	w := c.Warnings()
+	if len(w) != 1 || !strings.Contains(w[0], "projects myapp [3f2a9c1e5b7d0a46] and twin [bbbb000011112222] map to the same path") {
+		t.Errorf("Warnings = %v, want same-path warning", w)
+	}
+	// On a case-sensitive platform differently-cased paths are distinct.
+	c.Projects[1].Path = "~/work/MYAPP"
+	w = c.Warnings()
+	if caseInsensitivePaths {
+		if len(w) != 1 {
+			t.Errorf("Warnings = %v, want one same-path warning on a case-insensitive platform", w)
+		}
+	} else if len(w) != 0 {
+		t.Errorf("Warnings = %v, want none on a case-sensitive platform", w)
+	}
 }
 
 func TestParseSize(t *testing.T) {
@@ -901,6 +927,26 @@ func TestParseSize(t *testing.T) {
 		{"0.7KB", 700, false},
 		{"1.25KiB", 1280, false},
 		{"0.3GB", 300_000_000, false},
+		// Beyond ~2^33 bytes a float64 product cannot represent these exact
+		// whole-byte values, so a tolerance-based check rejected them; the
+		// rational arithmetic must accept them exactly.
+		{"16.001GB", 16_001_000_000, false},
+		{"0.017TB", 17_000_000_000, false},
+		{"1.001TB", 1_001_000_000_000, false},
+		{"123.456789GB", 123_456_789_000, false},
+		{"0.5TiB", 1 << 39, false},
+		{"1.999999999TB", 1_999_999_999_000, false},
+		// ...and genuine fractions at >= 512TiB, where a float64 has no
+		// bits left below one byte, must still be rejected.
+		{"512.04TiB", 0, true},
+		{"1024.0000000000001TiB", 0, true},
+		{"8000000.0000000000001TB", 0, true},
+		// Exact binary halves at that scale are whole bytes and must pass.
+		{"1024.5TiB", 1024*(1<<40) + 1<<39, false},
+		// Exact but past int64 after multiplication.
+		{"8388608.5TiB", 0, true},
+		{"9223372.036854775807TB", 9223372036854775807, false},
+		{"9223372.036854775808TB", 0, true},
 		{"1.2.3MB", 0, true},
 		{"2 M B", 0, true},
 		{"2MiBs", 0, true},
@@ -1368,4 +1414,168 @@ func equalConfig(a, b *Config) bool {
 		}
 	}
 	return true
+}
+
+func TestSaveTightensExistingDirMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permission bits are not honoured on Windows")
+	}
+	setHome(t)
+	root := t.TempDir()
+	rootBefore, err := os.Stat(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(root, "private-sync")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Some umasks strip bits; make sure the fixture really is loose.
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "config.yaml")
+	if err := valid().Save(path); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	st, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode().Perm() != DirMode {
+		t.Errorf("pre-existing dir mode = %o after Save, want %o (DirMode)", st.Mode().Perm(), DirMode)
+	}
+	fst, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fst.Mode().Perm() != FileMode {
+		t.Errorf("file mode = %o, want %o", fst.Mode().Perm(), FileMode)
+	}
+	// The parent of the config directory is not ours and must be left alone.
+	rst, err := os.Stat(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rst.Mode().Perm() != rootBefore.Mode().Perm() {
+		t.Errorf("root dir mode changed from %o to %o", rootBefore.Mode().Perm(), rst.Mode().Perm())
+	}
+	// Saving again over a directory that is already 0700 is a no-op.
+	if err := valid().Save(path); err != nil {
+		t.Fatalf("second Save: %v", err)
+	}
+	if _, err := Load(path); err != nil {
+		t.Fatalf("Load after Save: %v", err)
+	}
+}
+
+func TestProjectAmbiguousName(t *testing.T) {
+	home := setHome(t)
+	c := valid()
+	c.Projects = []ProjectConfig{
+		{ID: "id-one", Name: "shared", Path: "~/Work/one"},
+		{ID: "id-two", Name: "SHARED", Path: "~/Work/two"},
+		{ID: "id-three", Name: "unique", Path: "~/Work/three"},
+	}
+	// Duplicate names are legal.
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	// ...but reported as a warning pointing at ids.
+	w := c.Warnings()
+	if len(w) != 1 || !strings.Contains(w[0], `share the name "SHARED"`) || !strings.Contains(w[0], "refer to them by id") {
+		t.Errorf("Warnings = %v, want a single shared-name warning", w)
+	}
+	for _, q := range []string{"shared", "SHARED", "Shared"} {
+		if p, ok := c.Project(q); ok {
+			t.Errorf("Project(%q) = %+v, true; want not found for an ambiguous name", q, *p)
+		}
+		_, err := c.ProjectPath(q)
+		if !errors.Is(err, ErrAmbiguousProject) {
+			t.Errorf("ProjectPath(%q) err = %v, want ErrAmbiguousProject", q, err)
+		}
+		if err == nil || !strings.Contains(err.Error(), "matches 2 projects") || !strings.Contains(err.Error(), "use the project id") {
+			t.Errorf("ProjectPath(%q) err = %v, want count and id hint", q, err)
+		}
+		if errors.Is(err, ErrUnknownProject) {
+			t.Errorf("ProjectPath(%q) must not also be ErrUnknownProject", q)
+		}
+	}
+	// Ids still resolve each of them, and a unique name still works.
+	for _, tc := range []struct{ q, wantID, wantDir string }{
+		{"id-one", "id-one", "one"},
+		{"id-two", "id-two", "two"},
+		{"unique", "id-three", "three"},
+		{"UNIQUE", "id-three", "three"},
+	} {
+		p, ok := c.Project(tc.q)
+		if !ok || p.ID != tc.wantID {
+			t.Errorf("Project(%q) = %+v, %v; want id %s", tc.q, p, ok, tc.wantID)
+		}
+		got, err := c.ProjectPath(tc.q)
+		if err != nil || got != filepath.Join(home, "Work", tc.wantDir) {
+			t.Errorf("ProjectPath(%q) = %q, %v", tc.q, got, err)
+		}
+	}
+	// An id that equals an ambiguous name wins outright.
+	c.AddProject(ProjectConfig{ID: "shared", Name: "byid", Path: "~/Work/four"})
+	if p, ok := c.Project("shared"); !ok || p.ID != "shared" {
+		t.Errorf("Project(\"shared\") = %+v, %v; want the project whose id is \"shared\"", p, ok)
+	}
+	// Unknown names wrap ErrUnknownProject and keep the legacy text.
+	_, err := c.ProjectPath("missing")
+	if !errors.Is(err, ErrUnknownProject) || err == nil || err.Error() != "unknown project missing" {
+		t.Errorf("ProjectPath(missing) err = %v", err)
+	}
+	// Removing one of the twins makes the name unique again.
+	if !c.RemoveProject("id-two") {
+		t.Fatal("RemoveProject(id-two) = false")
+	}
+	c.RemoveProject("shared")
+	if p, ok := c.Project("shared"); !ok || p.ID != "id-one" {
+		t.Errorf("after removing the twin, Project(shared) = %+v, %v; want id-one", p, ok)
+	}
+	if w := c.Warnings(); len(w) != 0 {
+		t.Errorf("Warnings after de-duplication = %v, want none", w)
+	}
+}
+
+func TestDefaultZeroDirs(t *testing.T) {
+	setHome(t)
+	t.Setenv("XDG_DATA_HOME", "")
+	c := Default(paths.Dirs{})
+	if c.Key.File.Path != "" {
+		t.Errorf("Key.File.Path = %q, want empty for a zero Dirs (a relative \"key\" would be rejected)", c.Key.File.Path)
+	}
+	if c.Key.Source != KeyPrompt {
+		t.Errorf("Key.Source = %q, want prompt", c.Key.Source)
+	}
+	if c.Vault.Path != "~/.local/share/private-sync/vault" {
+		t.Errorf("Vault.Path = %q, want contracted default", c.Vault.Path)
+	}
+	if err := c.Validate(); err != nil {
+		t.Errorf("Default(zero Dirs) must validate: %v", err)
+	}
+	if w := c.Warnings(); len(w) != 0 {
+		t.Errorf("Warnings = %v, want none", w)
+	}
+	kp, err := c.KeyFilePath()
+	if err != nil || kp != "" {
+		t.Errorf("KeyFilePath = %q, %v; want empty, nil", kp, err)
+	}
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := c.Save(path); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	back, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !equalConfig(c, back) {
+		t.Errorf("round trip mismatch:\n got %+v\nwant %+v", back, c)
+	}
+	// A populated Dirs still yields the contracted key path.
+	if kf := Default(testDirs(filepath.Join(os.Getenv("HOME")))).Key.File.Path; kf != "~/.config/private-sync/key" {
+		t.Errorf("Default(populated).Key.File.Path = %q", kf)
+	}
 }

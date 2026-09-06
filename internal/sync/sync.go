@@ -280,6 +280,14 @@ type Options struct {
 	AcceptRollback   bool
 	Track            map[ItemKey]bool // paths explicitly (re)added this run
 	Progress         func(Event)
+
+	// Meta, when set, is asked for this machine's description of every
+	// project Apply touches (spec §9.3: after a project's items, "meta (if
+	// changed)"). A true result is written as this machine's ProjectMeta
+	// when it differs from the stored one; a zero CreatedAt keeps the stored
+	// creation time. Without the hook the meta file is owned by the linking
+	// code (app.Link) and Apply never writes it.
+	Meta func(projectID string) (vault.ProjectMeta, bool)
 }
 
 // Report summarises Apply.
@@ -325,6 +333,49 @@ type Engine struct {
 	maxFileSize int64
 	now         func() time.Time
 	hostname    func() string
+
+	// warn receives the journal-reading warnings of the operations that have
+	// no plan to put them in (see SetWarningHandler).
+	warn func(projectID, warning string)
+}
+
+// SetWarningHandler installs fn to receive the warnings the vault raises
+// while Untrack, DeleteEverywhere and TrackedPaths read a project's journals
+// (spec §5: stray files such as a Drive "(1)" or Dropbox "conflicted copy"
+// journal are skipped with a warning naming the file). Plan reports the same
+// warnings in ProjectPlan.Warnings and needs no handler. nil removes it.
+func (e *Engine) SetWarningHandler(fn func(projectID, warning string)) {
+	if e != nil {
+		e.warn = fn
+	}
+}
+
+// warnAll forwards warnings to the handler, if any.
+func (e *Engine) warnAll(projectID string, warnings []string) {
+	if e == nil || e.warn == nil {
+		return
+	}
+	for _, w := range warnings {
+		e.warn(projectID, w)
+	}
+}
+
+// JournalSeqKey is the state.Store journal key under which the engine keeps
+// the sequence high-water mark of one machine's journal for one project:
+// "<projectID>/<machineID>". Journals (and their Seq) live per (project,
+// machine) — projects/<project>/state/<machine>.json.enc — so a mark keyed by
+// machine alone would let the Seq of one project trip the rollback check of
+// every other project linked on this machine. Every store.JournalSeq /
+// SetJournalSeq call the engine makes uses this key; other packages that
+// inspect or reset the marks (status, projects unlink) must build it here
+// rather than passing a bare machine id. Neither id contains a '/'.
+func JournalSeqKey(projectID, machineID string) string {
+	return projectID + "/" + machineID
+}
+
+// seqKey is the internal alias of JournalSeqKey.
+func seqKey(projectID, machineID string) string {
+	return JournalSeqKey(projectID, machineID)
 }
 
 // New creates an engine.
@@ -511,6 +562,10 @@ type Summary struct {
 }
 
 // Summarize counts a project's items.
+//
+// A converge onto a tombstone (decision table row 5: deleted in the vault
+// and already absent locally) only records the base and changes nothing the
+// user can see, so it counts as in sync rather than as a remote change.
 func Summarize(pp *ProjectPlan) Summary {
 	var s Summary
 	if pp == nil {
@@ -521,6 +576,9 @@ func Summarize(pp *ProjectPlan) Summary {
 		a := it.Action
 		if a == ActionReportOnly {
 			a = it.Original
+		}
+		if a == ActionConverge && it.Head != nil && it.Head.Kind == vault.KindDeleted {
+			a = ActionInSync
 		}
 		switch a {
 		case ActionInSync:

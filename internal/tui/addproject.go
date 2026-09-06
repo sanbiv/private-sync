@@ -65,12 +65,20 @@ type addModel struct {
 	fetchCancel context.CancelFunc
 	fetchSpin   spinner.Model
 	fetchGen    int
+	fetchErr    error // set on a failed fetch; "enter" re-runs enterCmd(stepFetch)
 
-	// stepIdentify / stepAssociate
-	fps       []identity.Fingerprint
-	matches   []identity.Match
-	vaultByID map[string]vault.Project
-	assocIdx  int // index into matches; len(matches) means "create new"
+	// stepIdentify / stepAssociate. identGen is the same kind of guard as
+	// fetchGen/scanGen above, for identifyMsg: without it, esc back to
+	// stepPath followed by a different directory could let a stale
+	// identifyMsg for the OLD directory land after the new identify starts,
+	// applying the wrong fingerprints/matches to the wizard.
+	identCtx    context.Context
+	identCancel context.CancelFunc
+	identGen    int
+	fps         []identity.Fingerprint
+	matches     []identity.Match
+	vaultByID   map[string]vault.Project
+	assocIdx    int // index into matches; len(matches) means "create new"
 
 	// resolved outcome of identify/associate
 	creatingNew bool
@@ -181,9 +189,12 @@ func (m *addModel) enterCmd(step addStep) tea.Cmd {
 		m.fetchCtx, m.fetchCancel = context.WithCancel(m.ctx)
 		m.fetchSpin = newSpinner()
 		m.fetchGen++
+		m.fetchErr = nil
 		return tea.Batch(m.fetchSpin.Tick, startFetchCmd(m.fetchCtx, m.s.Engine, m.fetchGen))
 	case stepIdentify:
-		return identifyCmd(m.ctx, m.s, m.dir)
+		m.identCtx, m.identCancel = context.WithCancel(m.ctx)
+		m.identGen++
+		return identifyCmd(m.identCtx, m.s, m.dir, m.identGen)
 	case stepNewName:
 		def := filepath.Base(m.dir)
 		ni := textinput.New()
@@ -284,29 +295,33 @@ func (m *addModel) goBack() (bool, tea.Cmd) {
 }
 
 // identifyMsg carries s.Identify's result plus the vault's project list (for
-// displaying match names).
+// displaying match names). gen ties it back to the identGen that was current
+// when the identify started, so a stale message from a cancelled/superseded
+// run (esc back to stepPath, a different directory, identify started again)
+// is ignored instead of being applied to the wrong directory.
 type identifyMsg struct {
+	gen       int
 	fps       []identity.Fingerprint
 	matches   []identity.Match
 	vaultByID map[string]vault.Project
 	err       error
 }
 
-func identifyCmd(ctx context.Context, s *app.Session, dir string) tea.Cmd {
+func identifyCmd(ctx context.Context, s *app.Session, dir string, gen int) tea.Cmd {
 	return func() tea.Msg {
 		fps, matches, err := s.Identify(ctx, dir)
 		if err != nil {
-			return identifyMsg{err: err}
+			return identifyMsg{gen: gen, err: err}
 		}
 		projs, _, err := s.VaultProjects()
 		if err != nil {
-			return identifyMsg{fps: fps, matches: matches, err: err}
+			return identifyMsg{gen: gen, fps: fps, matches: matches, err: err}
 		}
 		byID := make(map[string]vault.Project, len(projs))
 		for _, p := range projs {
 			byID[p.ID] = p
 		}
-		return identifyMsg{fps: fps, matches: matches, vaultByID: byID}
+		return identifyMsg{gen: gen, fps: fps, matches: matches, vaultByID: byID}
 	}
 }
 
@@ -374,14 +389,22 @@ func (m *addModel) updatePath(msg tea.Msg) (bool, tea.Cmd) {
 func (m *addModel) updateFetch(msg tea.Msg) (bool, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
-		if msg.String() == "esc" {
+		switch msg.String() {
+		case "esc":
 			if m.fetchCancel != nil {
 				m.fetchCancel()
 			}
 			done, cmd := m.goBack()
 			return done, cmd
+		case "enter":
+			if m.fetchErr != nil {
+				return false, m.enterCmd(stepFetch)
+			}
 		}
 	case spinner.TickMsg:
+		if m.fetchErr != nil {
+			return false, nil // fetch already failed: stop animating
+		}
 		var cmd tea.Cmd
 		m.fetchSpin, cmd = m.fetchSpin.Update(msg)
 		return false, cmd
@@ -394,8 +417,15 @@ func (m *addModel) updateFetch(msg tea.Msg) (bool, tea.Cmd) {
 		if msg.Gen != m.fetchGen {
 			return false, nil // stale: from a fetch esc already cancelled
 		}
+		// The fetch (success or failure) is over: release the child context
+		// enterCmd derived from m.ctx now rather than only on esc, or it
+		// leaks its parent-context registration for the rest of the
+		// program's life (syncView.handleDone does the same on every path).
+		if m.fetchCancel != nil {
+			m.fetchCancel()
+		}
 		if msg.Err != nil {
-			m.err = msg.Err.Error()
+			m.fetchErr = msg.Err
 			return false, nil
 		}
 		return false, m.goTo(stepIdentify)
@@ -407,9 +437,15 @@ func (m *addModel) updateIdentify(msg tea.Msg) (bool, tea.Cmd) {
 	msgv, ok := msg.(identifyMsg)
 	if !ok {
 		if key, ok := msg.(tea.KeyMsg); ok && key.String() == "esc" {
+			if m.identCancel != nil {
+				m.identCancel()
+			}
 			return m.goBack()
 		}
 		return false, nil
+	}
+	if msgv.gen != m.identGen {
+		return false, nil // stale: from an identify esc already cancelled
 	}
 	if msgv.err != nil {
 		m.err = msgv.err.Error()
@@ -562,6 +598,13 @@ func (m *addModel) updateScan(msg tea.Msg) (bool, tea.Cmd) {
 		if msg.Gen != m.scanGen {
 			return false, nil // stale: from a scan esc already cancelled
 		}
+		// The scan (success or failure) is over: release the child context
+		// enterCmd derived from m.ctx now rather than only on esc, or it
+		// leaks its parent-context registration for the rest of the
+		// program's life (syncView.handleDone does the same on every path).
+		if m.scanCancel != nil {
+			m.scanCancel()
+		}
 		if msg.Err != nil {
 			m.scanErr = msg.Err
 			return false, nil
@@ -671,8 +714,13 @@ func (m *addModel) View() string {
 		b.WriteString("Project directory:\n" + m.pathInput.View() + "\n\n")
 		b.WriteString(styles.Help.Render("enter: continue  esc: cancel"))
 	case stepFetch:
-		fmt.Fprintf(&b, "%s fetching remote...\n\n", m.fetchSpin.View())
-		b.WriteString(styles.Help.Render("esc: cancel"))
+		if m.fetchErr != nil {
+			b.WriteString(styles.Error.Render("fetch failed: "+m.fetchErr.Error()) + "\n\n")
+			b.WriteString(styles.Help.Render("enter: retry  esc: back"))
+		} else {
+			fmt.Fprintf(&b, "%s fetching remote...\n\n", m.fetchSpin.View())
+			b.WriteString(styles.Help.Render("esc: cancel"))
+		}
 	case stepIdentify:
 		b.WriteString("identifying project...\n")
 	case stepAssociate:
@@ -980,6 +1028,14 @@ func cleanRelPath(rel string) (string, bool) {
 	}
 	rel = filepath.ToSlash(filepath.Clean(rel))
 	if rel == "." || rel == ".." || strings.HasPrefix(rel, "../") || filepath.IsAbs(rel) {
+		return "", false
+	}
+	// filepath.IsAbs is volume-relative on Windows: "/etc/passwd" has no
+	// drive letter, so IsAbs reports false there even though the leading
+	// slash still roots it at the current drive, and a "C:foo" / "C:\foo"
+	// volume-name form would otherwise slip through too. Reject both
+	// explicitly so a rooted path never gets joined under the project dir.
+	if strings.HasPrefix(rel, "/") || filepath.VolumeName(rel) != "" {
 		return "", false
 	}
 	return rel, true

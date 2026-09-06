@@ -7,8 +7,6 @@ import (
 	"os"
 	"strings"
 
-	// "time"
-
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -401,8 +399,6 @@ func dashboardBadge(pp *sync.ProjectPlan) (string, lipgloss.Style) {
 		return "remote changes", styles.BadgeWarn
 	case sum.Pending > 0:
 		return "pending", styles.BadgeWarn
-	case sum.LocalChanges > 0 && sum.RemoteChanges > 0:
-		return "local changes", styles.BadgeInfo
 	case sum.LocalChanges > 0:
 		return "local changes", styles.BadgeInfo
 	case sum.RemoteChanges > 0:

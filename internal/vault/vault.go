@@ -11,6 +11,7 @@ package vault
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -63,6 +64,12 @@ var (
 	// not a non-empty, relative, slash-separated vault path (the AAD that
 	// binds a document to its location).
 	ErrBadDocPath = errors.New("document path must be a non-empty relative slash-separated vault path")
+	// ErrBadEntryPath is returned by WriteJournal (and, wrapped in
+	// ErrUnreadableJournal, by the journal readers) when a journal entry's
+	// path is not a non-empty, relative, slash-separated project path, or when
+	// Entry.Path disagrees with the entries map key. The sync engine writes
+	// files at these paths, so "../x", "/abs" or "a\b" must never reach it.
+	ErrBadEntryPath = errors.New("journal entry path must be a non-empty relative slash-separated project path")
 )
 
 // File and directory names inside the vault.
@@ -80,6 +87,9 @@ const (
 	VaultKeyAADPrefix = "vault-key:"
 	// vaultIDLen is the length of a vault id: 16 hex characters (crypto.RandomHex(8)).
 	vaultIDLen = 16
+	// BlobIDLen is the length of a blob id: hex(HMAC-SHA256) is 64 characters.
+	// BlobPath, ReadBlob and HasBlob accept nothing else.
+	BlobIDLen = 2 * sha256.Size
 
 	// maxVaultFileSize bounds vault.json reads (it is a few hundred bytes).
 	maxVaultFileSize = 1 << 20
@@ -100,6 +110,11 @@ const (
 	KindDeleted               // tombstone: delete everywhere
 	KindUntracked             // tombstone: stop syncing, keep local copies
 )
+
+// Valid reports whether k is one of the known kinds. Journals carrying any
+// other value are refused (readJournal, WriteJournal): ResolveHeads would
+// otherwise treat an unknown kind as a live file that can win a head.
+func (k Kind) Valid() bool { return k >= KindFile && k <= KindUntracked }
 
 // String renders the kind for logs and warnings.
 func (k Kind) String() string {
@@ -267,9 +282,16 @@ type MachineInfo struct {
 // (Clock = merge(all candidates' clocks).Tick(self)) requires, and the next
 // fetch does not report a spurious concurrent head. Candidates keep their
 // original clocks.
+//
+// Candidates is exactly the set of entries that survived dominance filtering:
+// one per machine, in machine-id order, whether or not the head resolved.
+// Entries with Equal clocks are never collapsed (the same version recorded by
+// two machines yields two candidates), so len(Candidates) is the number of
+// machines whose entry is not dominated; use Entry == nil (Concurrent) to
+// detect a conflict, never the candidate count.
 type Head struct {
 	Path       string
-	Candidates []Entry // survivors of dominance filtering, >= 1
+	Candidates []Entry // survivors of dominance filtering, one per machine, >= 1
 	Entry      *Entry  // non-nil when the candidates agree (single head)
 	Base       string  // blob shared by all candidates' Parents; "" if none
 }
@@ -310,9 +332,9 @@ func ResolveHeads(journals map[string]*Journal) map[string]Head {
 			if !ok {
 				continue
 			}
-			if e.Path == "" {
-				e.Path = p
-			}
+			// The map key is the path (readJournal guarantees the two agree
+			// for journals read from disk); Head.Path and Entry.Path never differ.
+			e.Path = p
 			if e.Machine == "" {
 				e.Machine = id
 			}
@@ -344,27 +366,15 @@ func resolveHead(p string, cands []candidate) Head {
 		}
 	}
 
-	// Equal clocks with the same state are one version seen by several
-	// machines: keep the first. Equal clocks with different state stay
-	// (treated as concurrent).
-	var deduped []candidate
-	for _, c := range survivors {
-		dup := false
-		for _, k := range deduped {
-			if c.entry.Clock.Compare(k.entry.Clock) == Equal && sameState(c.entry, k.entry) {
-				dup = true
-				break
-			}
-		}
-		if !dup {
-			deduped = append(deduped, c)
-		}
-	}
-	survivors = deduped
-
+	// Equal clocks are not collapsed (see Head): the same version recorded by
+	// several machines stays one candidate per machine. The state comparison
+	// below resolves them to a single head when they agree, and Equal clocks
+	// with different state are concurrent like any other survivors.
 	h := Head{Path: p, Candidates: make([]Entry, 0, len(survivors))}
 	for _, c := range survivors {
-		h.Candidates = append(h.Candidates, c.entry)
+		// Detached like Entry: a caller that writes into a candidate's Clock
+		// or Parents must not silently edit the journal it was read from.
+		h.Candidates = append(h.Candidates, detached(c.entry))
 	}
 
 	allSame := true
@@ -410,6 +420,18 @@ func singleHead(winner Entry, survivors []candidate) *Entry {
 	}
 	winner.Parents = append([]string(nil), winner.Parents...)
 	return &winner
+}
+
+// detached returns e with its reference fields (Clock, Parents) copied, so
+// the result shares nothing with the journal it came from. nil stays nil.
+func detached(e Entry) Entry {
+	if e.Clock != nil {
+		e.Clock = e.Clock.Copy()
+	}
+	if e.Parents != nil {
+		e.Parents = append(make([]string, 0, len(e.Parents)), e.Parents...)
+	}
+	return e
 }
 
 // sameState reports whether two entries carry the same (Kind, Blob) tuple.
@@ -500,17 +522,30 @@ type Vault struct {
 	// (fsutil names it <target>.psv-tmp-<writer suffix>, which is per handle,
 	// not per call).
 	blobLocks [256]sync.Mutex
+	// docMu serialises document writes (journals, meta, machine files) for
+	// the same reason: two WriteJournal calls for one project through one
+	// handle would otherwise open the same <target>.psv-tmp-<suffix> with
+	// O_TRUNC, interleave their bytes (an undecryptable journal makes the
+	// whole project unreadable) or lose the rename race. Documents are small
+	// and written sequentially by the sync engine, so one lock is enough.
+	docMu sync.Mutex
 }
 
-// Exists reports whether dir contains a vault.json.
+// Exists reports whether dir contains a vault.json. An empty dir is never a
+// vault (it would otherwise resolve to the process working directory).
 func Exists(dir string) bool {
+	if dir == "" {
+		return false
+	}
 	st, err := os.Stat(filepath.Join(dir, VaultFileName))
 	return err == nil && st.Mode().IsRegular()
 }
 
 // Create initialises a new vault: writes vault.json (0600) and nothing else.
 // writerID is the machine id (used for temp file suffixes and to restrict
-// writes to this machine's own files); see checkWriterID for its rules.
+// writes to this machine's own files); see checkWriterID for its rules. It is
+// an addition to the Create(dir, passphrase, params) signature listed in the
+// spec's §5 API sketch: "" is the unrestricted tooling mode (temp suffix "w").
 //
 // A zero params selects crypto.DefaultKDFParams; params without a salt get a
 // fresh random one. The passphrase buffer is zeroed before Create returns.
@@ -634,15 +669,17 @@ func Open(dir string, passphrase []byte, writerID string) (*Vault, error) {
 	}
 	kek, err := crypto.DeriveKEK(passphrase, vf.KDF)
 	if err != nil {
-		return nil, fmt.Errorf("vault.Open: %w: %v", ErrInvalidVault, err)
+		return nil, fmt.Errorf("vault.Open: %w: %w", ErrInvalidVault, err)
 	}
 	vk, err := crypto.UnwrapKey(kek, vf.WrappedKey, VaultKeyAADPrefix+vf.ID)
 	crypto.Zero(kek)
 	if err != nil {
 		if errors.Is(err, crypto.ErrAuth) {
+			// Deliberately not wrapped: a failed unwrap is the passphrase check
+			// (spec §4), and callers must not mistake it for a corrupt file.
 			return nil, fmt.Errorf("vault.Open: %w", ErrWrongPassphrase)
 		}
-		return nil, fmt.Errorf("vault.Open: %w: %v", ErrInvalidVault, err)
+		return nil, fmt.Errorf("vault.Open: %w: %w", ErrInvalidVault, err)
 	}
 	keys, err := crypto.NewKeys(vk)
 	if err != nil {
@@ -685,13 +722,25 @@ func readVaultFile(dir string) (vaultFile, error) {
 			return vf, fmt.Errorf("%w: %s", ErrNoVault, dir)
 		}
 		if errors.Is(err, fsutil.ErrTooLarge) {
-			return vf, fmt.Errorf("%w: %v", ErrInvalidVault, err)
+			return vf, fmt.Errorf("%w: %w", ErrInvalidVault, err)
 		}
 		return vf, fmt.Errorf("read %s: %w", VaultFileName, err)
 	}
+	// The version is examined before the rest of the document is decoded: a
+	// newer format may change the shape of kdf or wrapped_key, and §13 wants
+	// that refused as "newer version", not reported as tampering.
+	var probe struct {
+		Version int `json:"version"`
+	}
+	if err := json.NewDecoder(bytes.NewReader(data)).Decode(&probe); err != nil {
+		return vf, fmt.Errorf("%w: %w", ErrInvalidVault, err)
+	}
+	if probe.Version > Version {
+		return vf, fmt.Errorf("%w: version %d (this build supports %d)", ErrNewerVersion, probe.Version, Version)
+	}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	if err := dec.Decode(&vf); err != nil {
-		return vf, fmt.Errorf("%w: %v", ErrInvalidVault, err)
+		return vf, fmt.Errorf("%w: %w", ErrInvalidVault, err)
 	}
 	// Decode stops after the first JSON value; anything but whitespace after
 	// it means the file is not the document we wrote.
@@ -713,7 +762,7 @@ func validateVaultFile(vf vaultFile) error {
 		return fmt.Errorf("%w: bad vault id", ErrInvalidVault)
 	}
 	if err := vf.KDF.Validate(); err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidVault, err)
+		return fmt.Errorf("%w: %w", ErrInvalidVault, err)
 	}
 	if want := crypto.MinCiphertextSize + crypto.KeySize; len(vf.WrappedKey) != want {
 		return fmt.Errorf("%w: wrapped_key is %d bytes (want %d)", ErrInvalidVault, len(vf.WrappedKey), want)
@@ -851,6 +900,18 @@ func (v *Vault) ready() error {
 	return nil
 }
 
+// closedOr maps an error from the key set to ErrClosed (wrapping err) when
+// the vault has been closed since ready() last passed: ready() is not held
+// across SealBlob/OpenDoc/..., so a Close racing an operation makes crypto
+// report its own not-ready error, which is semantically ErrClosed to callers.
+// Any other error, and nil, is returned unchanged.
+func (v *Vault) closedOr(err error) error {
+	if err == nil || v.ready() == nil {
+		return err
+	}
+	return fmt.Errorf("%w: %w", ErrClosed, err)
+}
+
 // BlobID returns the content-addressed id of plaintext ("" on a nil or closed vault).
 func (v *Vault) BlobID(p []byte) string {
 	if v == nil {
@@ -930,8 +991,10 @@ func BlobPath(id string) string {
 	return path.Join(BlobsDir, id[:2], id+BlobSuffix)
 }
 
-// validBlobID accepts lowercase hex ids of at least two characters.
-func validBlobID(id string) bool { return len(id) >= 2 && isHex(id) }
+// validBlobID accepts exactly what SealBlob produces: BlobIDLen (64)
+// lowercase hex characters. Anything shorter would probe or create paths
+// like blobs/ab/ab.enc that no blob can ever have.
+func validBlobID(id string) bool { return len(id) == BlobIDLen && isHex(id) }
 
 func isHex(s string) bool {
 	if s == "" {
@@ -960,7 +1023,7 @@ func (v *Vault) WriteBlob(plaintext []byte) (id string, created bool, err error)
 	}
 	id, ct, err := v.keys.SealBlob(plaintext)
 	if err != nil {
-		return "", false, fmt.Errorf("vault.WriteBlob: %w", err)
+		return "", false, fmt.Errorf("vault.WriteBlob: %w", v.closedOr(err))
 	}
 	if !validBlobID(id) { // cannot happen with a ready key set; keeps blobLock in range
 		return "", false, fmt.Errorf("vault.WriteBlob: %w: %q", ErrBadBlobID, id)
@@ -971,7 +1034,7 @@ func (v *Vault) WriteBlob(plaintext []byte) (id string, created bool, err error)
 	lock := v.blobLock(id)
 	lock.Lock()
 	defer lock.Unlock()
-	if existing, rerr := fsutil.ReadFileMax(file, maxBlobSize); rerr == nil && bytes.Equal(existing, ct) {
+	if v.sameBlobOnDisk(file, ct) {
 		return id, false, nil
 	}
 	if err := fsutil.WriteFileAtomic(file, ct, 0o600, v.tempSuffix()); err != nil {
@@ -979,6 +1042,22 @@ func (v *Vault) WriteBlob(plaintext []byte) (id string, created bool, err error)
 	}
 	v.record(rel)
 	return id, true, nil
+}
+
+// blobReadFile reads an existing blob for the WriteBlob dedupe comparison
+// (a variable so tests can count the reads).
+var blobReadFile = fsutil.ReadFileMax
+
+// sameBlobOnDisk reports whether file already holds exactly ct. The size is
+// checked with a stat first: a file of a different size (absent, truncated,
+// a torn write) is never read into memory just to find out it differs.
+func (v *Vault) sameBlobOnDisk(file string, ct []byte) bool {
+	st, err := os.Stat(file)
+	if err != nil || !st.Mode().IsRegular() || st.Size() != int64(len(ct)) {
+		return false
+	}
+	existing, err := blobReadFile(file, maxBlobSize)
+	return err == nil && bytes.Equal(existing, ct)
 }
 
 // blobLock returns the mutex serialising writes of blobs whose id starts
@@ -1017,6 +1096,10 @@ func (v *Vault) ReadBlob(id string) ([]byte, error) {
 	}
 	pt, err := v.keys.OpenBlob(id, ct)
 	if err != nil {
+		// A vault closed while the read was in flight is not a missing blob.
+		if cerr := v.closedOr(err); errors.Is(cerr, ErrClosed) {
+			return nil, fmt.Errorf("vault.ReadBlob: %w", cerr)
+		}
 		return nil, fmt.Errorf("vault.ReadBlob: %w: %s: %w", ErrBlobMissing, rel, err)
 	}
 	return pt, nil
@@ -1042,7 +1125,11 @@ func (v *Vault) SealDoc(rel string, plaintext []byte) ([]byte, error) {
 	if err := checkDocPath(rel); err != nil {
 		return nil, fmt.Errorf("vault.SealDoc: %w", err)
 	}
-	return v.keys.SealDoc(rel, plaintext)
+	ct, err := v.keys.SealDoc(rel, plaintext)
+	if err != nil {
+		return nil, fmt.Errorf("vault.SealDoc: %w", v.closedOr(err))
+	}
+	return ct, nil
 }
 
 // OpenDoc decrypts a document sealed with SealDoc under the same path.
@@ -1053,7 +1140,11 @@ func (v *Vault) OpenDoc(rel string, ciphertext []byte) ([]byte, error) {
 	if err := checkDocPath(rel); err != nil {
 		return nil, fmt.Errorf("vault.OpenDoc: %w", err)
 	}
-	return v.keys.OpenDoc(rel, ciphertext)
+	pt, err := v.keys.OpenDoc(rel, ciphertext)
+	if err != nil {
+		return nil, fmt.Errorf("vault.OpenDoc: %w", v.closedOr(err))
+	}
+	return pt, nil
 }
 
 // checkDocPath enforces the canonical document AAD form of spec §4/§5: a
@@ -1061,21 +1152,46 @@ func (v *Vault) OpenDoc(rel string, ciphertext []byte) ([]byte, error) {
 // slash, no "." / ".." elements). An empty path would silently drop the
 // move-protection binding, and a platform-specific separator would make a
 // document sealed on Windows unopenable elsewhere.
-func checkDocPath(rel string) error {
+func checkDocPath(rel string) error { return checkRelPath(rel, ErrBadDocPath) }
+
+// checkEntryPath applies the same rules to a journal entry path (spec §5:
+// slash separated, relative to the project root), reported as ErrBadEntryPath.
+func checkEntryPath(p string) error { return checkRelPath(p, ErrBadEntryPath) }
+
+// checkRelPath is the shared rule set of checkDocPath and checkEntryPath;
+// bad wraps the violation.
+func checkRelPath(rel string, bad error) error {
 	switch {
 	case rel == "":
-		return fmt.Errorf("%w: empty", ErrBadDocPath)
+		return fmt.Errorf("%w: empty", bad)
 	case strings.ContainsRune(rel, '\\'):
-		return fmt.Errorf("%w: %q contains a backslash", ErrBadDocPath, rel)
+		return fmt.Errorf("%w: %q contains a backslash", bad, rel)
 	case strings.HasPrefix(rel, "/"):
-		return fmt.Errorf("%w: %q is absolute", ErrBadDocPath, rel)
+		return fmt.Errorf("%w: %q is absolute", bad, rel)
 	case strings.ContainsRune(rel, 0):
-		return fmt.Errorf("%w: %q contains a NUL byte", ErrBadDocPath, rel)
+		return fmt.Errorf("%w: %q contains a NUL byte", bad, rel)
 	}
 	for _, elem := range strings.Split(rel, "/") {
 		if elem == "" || elem == "." || elem == ".." {
-			return fmt.Errorf("%w: %q has an empty, \".\" or \"..\" element", ErrBadDocPath, rel)
+			return fmt.Errorf("%w: %q has an empty, \".\" or \"..\" element", bad, rel)
 		}
+	}
+	return nil
+}
+
+// checkEntry validates one journal entry against its map key: a known kind,
+// a well-formed path, and a Path field that (when set) matches the key.
+// Shared by readJournal and WriteJournal so a machine never writes what
+// every other machine would refuse.
+func checkEntry(p string, e Entry) error {
+	if !e.Kind.Valid() {
+		return fmt.Errorf("entry %q has unknown kind %d", p, e.Kind)
+	}
+	if err := checkEntryPath(p); err != nil {
+		return fmt.Errorf("entry %q: %w", p, err)
+	}
+	if e.Path != "" && e.Path != p {
+		return fmt.Errorf("entry %q: %w: path field is %q", p, ErrBadEntryPath, e.Path)
 	}
 	return nil
 }
@@ -1088,10 +1204,13 @@ func (v *Vault) writeDoc(rel string, value any) error {
 	}
 	ct, err := v.keys.SealDoc(rel, data)
 	if err != nil {
-		return err
+		return v.closedOr(err)
 	}
 	abs := filepath.Join(v.dir, filepath.FromSlash(rel))
-	if err := fsutil.WriteFileAtomic(abs, ct, 0o600, v.tempSuffix()); err != nil {
+	v.docMu.Lock()
+	err = fsutil.WriteFileAtomic(abs, ct, 0o600, v.tempSuffix())
+	v.docMu.Unlock()
+	if err != nil {
 		return err
 	}
 	v.record(rel)
@@ -1108,7 +1227,7 @@ func (v *Vault) readDoc(rel string, value any) error {
 	}
 	pt, err := v.keys.OpenDoc(rel, ct)
 	if err != nil {
-		return err
+		return v.closedOr(err)
 	}
 	if err := json.Unmarshal(pt, value); err != nil {
 		return fmt.Errorf("decode: %w", err)
@@ -1283,6 +1402,9 @@ func (v *Vault) readProject(id string) (*Project, []string, error) {
 		rel := metaPath(id, mid)
 		var m ProjectMeta
 		if err := v.readDoc(rel, &m); err != nil {
+			if errors.Is(err, ErrClosed) {
+				return nil, warnings, err
+			}
 			warnings = append(warnings, fmt.Sprintf("%s: unreadable project meta, skipped: %v", rel, err))
 			continue
 		}
@@ -1444,7 +1566,12 @@ func (v *Vault) readJournal(projectID, machineID string) (*Journal, error) {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("%w: %s: %v", ErrUnreadableJournal, rel, err)
+		if errors.Is(err, ErrClosed) { // the vault, not the journal, is unusable
+			return nil, err
+		}
+		// The cause stays in the chain (crypto.ErrAuth for a tampered file,
+		// fs.ErrPermission, fsutil.ErrTooLarge, a JSON error), as ReadBlob does.
+		return nil, fmt.Errorf("%w: %s: %w", ErrUnreadableJournal, rel, err)
 	}
 	switch j.Machine {
 	case machineID:
@@ -1456,7 +1583,14 @@ func (v *Vault) readJournal(projectID, machineID string) (*Journal, error) {
 	if j.Entries == nil {
 		j.Entries = map[string]Entry{}
 	}
+	// Entries are validated beyond decoding (kind, path shape, Path == key):
+	// the sync engine writes files at these paths, so a journal that names
+	// "../x" or claims one path under another key is refused as unreadable,
+	// with the same defense-in-depth as an unknown kind.
 	for p, e := range j.Entries {
+		if err := checkEntry(p, e); err != nil {
+			return nil, fmt.Errorf("%w: %s: %w", ErrUnreadableJournal, rel, err)
+		}
 		if e.Path == "" {
 			e.Path = p
 			j.Entries[p] = e
@@ -1484,11 +1618,28 @@ func (v *Vault) WriteJournal(projectID string, j *Journal) error {
 	if v.writerID != "" && j.Machine != v.writerID {
 		return fmt.Errorf("vault.WriteJournal: %w: journal of %q, writer is %q", ErrForeignMachine, j.Machine, v.writerID)
 	}
+	// Refuse what readJournal would refuse: a journal with an unknown kind, a
+	// malformed path or a Path field that disagrees with its key would be
+	// written fine and then make the whole project unreadable on the next
+	// fetch, on every machine. Nothing is modified until every entry passes.
+	for p, e := range j.Entries {
+		if err := checkEntry(p, e); err != nil {
+			return fmt.Errorf("vault.WriteJournal: %w", err)
+		}
+	}
 	next := *j
 	next.Seq = j.Seq + 1
 	next.UpdatedAt = time.Now().UTC()
 	if next.Entries == nil {
 		next.Entries = map[string]Entry{}
+	}
+	// An unset Path is filled from the key (as readJournal does on the way
+	// back), so the in-memory journal matches what lands on disk.
+	for p, e := range next.Entries {
+		if e.Path == "" {
+			e.Path = p
+			next.Entries[p] = e
+		}
 	}
 	rel := statePath(projectID, j.Machine)
 	if err := v.writeDoc(rel, &next); err != nil {
@@ -1519,11 +1670,23 @@ func (v *Vault) ListMachines() ([]MachineInfo, []string, error) {
 			if errors.Is(err, fs.ErrNotExist) {
 				continue
 			}
+			if errors.Is(err, ErrClosed) {
+				return nil, warnings, fmt.Errorf("vault.ListMachines: %w", err)
+			}
 			warnings = append(warnings, fmt.Sprintf("%s: unreadable machine info, skipped: %v", rel, err))
 			continue
 		}
-		if m.ID == "" {
+		// The file name is authoritative (a machine only writes its own file,
+		// spec §5): an empty id is filled in, a different one means the file
+		// was tampered with or copied over another machine's, so it is
+		// skipped with a warning like any other unusable name.
+		switch m.ID {
+		case mid:
+		case "":
 			m.ID = mid
+		default:
+			warnings = append(warnings, fmt.Sprintf("%s: machine info claims id %q, skipped", rel, m.ID))
+			continue
 		}
 		out = append(out, m)
 	}

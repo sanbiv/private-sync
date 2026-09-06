@@ -15,7 +15,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"math"
+	"math/big"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -158,12 +158,24 @@ func tempSuffix() string {
 }
 
 // Default returns a config with sensible defaults (remote none, prompt key source).
+//
+// d is normally the result of paths.Default(). A zero Dirs is tolerated: the
+// default key file path is then left empty (the prompt source does not need
+// one) instead of the relative "key" that Validate would reject. The vault
+// path always comes from paths.DefaultVaultDir, which needs a resolvable home
+// directory; without one it falls back to a relative path that Validate
+// reports, so Default(...).Save fails loudly rather than persisting a config
+// whose vault location depends on the working directory.
 func Default(d paths.Dirs) *Config {
+	keyFile := ""
+	if d.Config != "" {
+		keyFile = paths.ContractHome(d.DefaultKeyFile())
+	}
 	return &Config{
 		Version: CurrentVersion,
 		Machine: MachineConfig{Name: defaultMachineName()},
 		Vault:   VaultConfig{Path: paths.ContractHome(paths.DefaultVaultDir()), Remote: RemoteConfig{Type: RemoteNone, Git: GitRemote{Branch: DefaultBranch}}},
-		Key:     KeyConfig{Source: KeyPrompt, File: FileKey{Path: paths.ContractHome(d.DefaultKeyFile())}, Bitwarden: BitwardenKey{Field: DefaultBitwardenField}},
+		Key:     KeyConfig{Source: KeyPrompt, File: FileKey{Path: keyFile}, Bitwarden: BitwardenKey{Field: DefaultBitwardenField}},
 		Scan:    ScanConfig{MaxFileSize: "2MiB"},
 	}
 }
@@ -236,8 +248,20 @@ func (c *Config) Save(path string) error {
 	}
 	// DirMode is applied here directly (not via fsutil.EnsureDir) so that the
 	// exported constant can never drift from the mode actually used.
-	if err := os.MkdirAll(filepath.Dir(path), DirMode); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, DirMode); err != nil {
 		return fmt.Errorf("config: create directory: %w", err)
+	}
+	// MkdirAll only sets the mode on directories it creates. A config
+	// directory created by hand (or by an older build) with looser
+	// permissions would otherwise keep exposing config.yaml's parent, so the
+	// spec's "config dir 0700" is re-applied on every save. Windows has no
+	// POSIX permission bits, and a failure here is not fatal: the file itself
+	// is still written 0600.
+	if runtime.GOOS != "windows" {
+		if st, err := os.Stat(dir); err == nil && st.IsDir() && st.Mode().Perm() != DirMode {
+			_ = os.Chmod(dir, DirMode)
+		}
 	}
 	if err := fsutil.WriteFileAtomic(path, data, FileMode, tempSuffix()); err != nil {
 		return fmt.Errorf("config: write %s: %w", path, err)
@@ -437,8 +461,21 @@ func (c *Config) Warnings() []string {
 			vaultPath = vp
 		}
 	}
+	// Duplicate names are legal (Validate allows them) but make name-based
+	// lookups ambiguous (Project / ProjectPath then refuse to guess), so the
+	// user is told to use ids. Names are compared the way Project does,
+	// case-insensitively.
+	byName := make(map[string]string, len(c.Projects))
 	byPath := make(map[string]string, len(c.Projects))
 	for _, p := range c.Projects {
+		if name := strings.TrimSpace(p.Name); name != "" {
+			key := strings.ToLower(name)
+			if other, dup := byName[key]; dup {
+				out = append(out, fmt.Sprintf("projects %s and %s share the name %q: name lookups are ambiguous, refer to them by id", other, projectLabel(p), p.Name))
+			} else {
+				byName[key] = projectLabel(p)
+			}
+		}
 		if !isStablePath(p.Path) {
 			continue
 		}
@@ -452,10 +489,16 @@ func (c *Config) Warnings() []string {
 		if vaultPath != "" && isWithin(vaultPath, pp) {
 			out = append(out, fmt.Sprintf("project %s path %s is inside the vault directory %s", projectLabel(p), p.Path, c.Vault.Path))
 		}
-		if other, dup := byPath[pp]; dup {
+		// Same folding as isWithin: on a case-insensitive filesystem
+		// ~/Work/myapp and ~/work/MyApp are one directory.
+		key := pp
+		if caseInsensitivePaths {
+			key = strings.ToLower(pp)
+		}
+		if other, dup := byPath[key]; dup {
 			out = append(out, fmt.Sprintf("projects %s and %s map to the same path %s", other, projectLabel(p), p.Path))
 		} else {
-			byPath[pp] = projectLabel(p)
+			byPath[key] = projectLabel(p)
 		}
 	}
 	return out
@@ -534,37 +577,28 @@ func ParseSize(s string) (int64, error) {
 	if !ok {
 		return 0, fmt.Errorf("invalid size %q: unknown unit %q (want B, KB, KiB, MB, MiB, GB, GiB, TB or TiB)", s, m[2])
 	}
-	if !strings.Contains(numStr, ".") {
-		n, err := strconv.ParseInt(numStr, 10, 64)
-		if err != nil {
-			return 0, fmt.Errorf("invalid size %q: %w", s, err)
-		}
-		if n != 0 && n > math.MaxInt64/mult {
-			return 0, fmt.Errorf("invalid size %q: too large", s)
-		}
-		return n * mult, nil
+	// The arithmetic is exact (big.Rat), never floating point: a float64 has
+	// only 53 bits of mantissa, so past a few GB it cannot tell "16.001GB"
+	// (exactly 16001000000 bytes) from a genuine fraction, and past 512TiB
+	// it cannot see a fraction at all. sizeRe has already restricted numStr
+	// to plain decimal digits with at most one dot, so SetString cannot be
+	// handed exponents, hex or "a/b" forms here.
+	r, ok := new(big.Rat).SetString(numStr)
+	if !ok {
+		return 0, fmt.Errorf("invalid size %q", s)
 	}
-	f, err := strconv.ParseFloat(numStr, 64)
-	if err != nil {
-		return 0, fmt.Errorf("invalid size %q: %w", s, err)
-	}
-	v := f * float64(mult)
-	if v >= math.MaxInt64 {
-		return 0, fmt.Errorf("invalid size %q: too large", s)
-	}
+	r.Mul(r, new(big.Rat).SetInt64(mult))
 	// A fractional value must land on a whole number of bytes whatever the
 	// unit: "1.5" (1.5 bytes) and "1.0001KB" (1000.1 bytes) are both rejected
-	// rather than silently rounded. The tolerance absorbs binary floating
-	// point noise (e.g. 0.1 * 1e9), which is far below one byte.
-	if math.Abs(v-math.Round(v)) > fractionalByteTolerance {
+	// rather than silently rounded.
+	if !r.IsInt() {
 		return 0, fmt.Errorf("invalid size %q: fractional bytes", s)
 	}
-	return int64(math.Round(v)), nil
+	if !r.Num().IsInt64() {
+		return 0, fmt.Errorf("invalid size %q: too large", s)
+	}
+	return r.Num().Int64(), nil
 }
-
-// fractionalByteTolerance is the largest distance from a whole number of
-// bytes that ParseSize still treats as rounding noise rather than a fraction.
-const fractionalByteTolerance = 1e-6
 
 // FormatSize renders n in the largest binary unit that divides it exactly
 // (e.g. 2097152 -> "2MiB", 1536 -> "1536"), the inverse of ParseSize.
@@ -583,33 +617,65 @@ func FormatSize(n int64) string {
 	return strconv.FormatInt(n, 10)
 }
 
-// Project finds a project by id or (case-insensitive) name. The returned
-// pointer aliases the slice element so callers may edit it in place.
+// ErrUnknownProject is wrapped by ProjectPath when no project has the given
+// id or name.
+var ErrUnknownProject = errors.New("unknown project")
+
+// ErrAmbiguousProject is wrapped by ProjectPath when a name matches more than
+// one project (Validate allows duplicate names; ids are the only identity).
+var ErrAmbiguousProject = errors.New("ambiguous project name")
+
+// Project finds a project by id or (case-insensitive) name. An exact id match
+// always wins. A name shared by several projects is ambiguous and reports
+// (nil, false) rather than silently picking one; use the id in that case
+// (ProjectPath distinguishes the two outcomes via ErrAmbiguousProject). The
+// returned pointer aliases the slice element so callers may edit it in place.
 func (c *Config) Project(idOrName string) (*ProjectConfig, bool) {
-	if c == nil || idOrName == "" {
+	p, n := c.lookupProject(idOrName)
+	if n != 1 {
 		return nil, false
+	}
+	return p, true
+}
+
+// lookupProject returns the first project matching idOrName and how many
+// matched: 1 for an exact id match (ids are unique after Validate) or a
+// unique name, >1 for a name shared by several projects, 0 for none.
+func (c *Config) lookupProject(idOrName string) (*ProjectConfig, int) {
+	if c == nil || idOrName == "" {
+		return nil, 0
 	}
 	for i := range c.Projects {
 		if c.Projects[i].ID == idOrName {
-			return &c.Projects[i], true
+			return &c.Projects[i], 1
 		}
 	}
+	var first *ProjectConfig
+	n := 0
 	for i := range c.Projects {
 		if c.Projects[i].Name != "" && strings.EqualFold(c.Projects[i].Name, idOrName) {
-			return &c.Projects[i], true
+			if first == nil {
+				first = &c.Projects[i]
+			}
+			n++
 		}
 	}
-	return nil, false
+	return first, n
 }
 
-// ProjectPath returns the expanded local path of a project.
+// ProjectPath returns the expanded local path of a project, looked up by id
+// or unique name (see Project). The error wraps ErrUnknownProject or
+// ErrAmbiguousProject so callers can tell the two apart.
 func (c *Config) ProjectPath(id string) (string, error) {
 	if c == nil {
 		return "", errNilConfig
 	}
-	p, ok := c.Project(id)
-	if !ok {
-		return "", errors.New("unknown project " + id)
+	p, n := c.lookupProject(id)
+	switch {
+	case n == 0:
+		return "", fmt.Errorf("%w %s", ErrUnknownProject, id)
+	case n > 1:
+		return "", fmt.Errorf("%w %q matches %d projects; use the project id", ErrAmbiguousProject, id, n)
 	}
 	return paths.ExpandHome(p.Path)
 }

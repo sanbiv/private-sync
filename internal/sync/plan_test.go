@@ -562,8 +562,11 @@ func TestDecisionTable(t *testing.T) {
 			if h.Entry.Clock[mA] != 1 || h.Entry.Clock[mB] != 1 {
 				t.Fatalf("clock = %v", h.Entry.Clock)
 			}
-			if b.st.JournalSeq(mB) != 1 || b.st.JournalSeq(mA) != 1 {
+			if b.st.JournalSeq(seqKey(projID, mB)) != 1 || b.st.JournalSeq(seqKey(projID, mA)) != 1 {
 				t.Fatalf("journal seqs = %v", b.st.JournalSeqs())
+			}
+			if b.st.JournalSeq(mA) != 0 || b.st.JournalSeq(mB) != 0 {
+				t.Fatalf("journal seqs keyed by machine alone: %v", b.st.JournalSeqs())
 			}
 		}},
 		{"row11 vault change downloads without trashing the base", func(t *testing.T, a, b *machine) {
@@ -800,8 +803,8 @@ func TestRollbackByJournalSequence(t *testing.T) {
 	if rep.Skipped != 1 || b.read("f") != "v2\n" {
 		t.Fatalf("report = %+v content = %q", rep, b.read("f"))
 	}
-	if b.st.JournalSeq(mA) != 2 {
-		t.Fatalf("stored seq lowered to %d", b.st.JournalSeq(mA))
+	if b.st.JournalSeq(seqKey(projID, mA)) != 2 {
+		t.Fatalf("stored seq lowered to %d", b.st.JournalSeq(seqKey(projID, mA)))
 	}
 	if bs, _ := b.base("f"); bs.Clock[mA] != 2 {
 		t.Fatalf("base changed: %+v", bs)
@@ -821,8 +824,8 @@ func TestRollbackByJournalSequence(t *testing.T) {
 	if len(b.trash()) != 1 {
 		t.Fatal("pre-image v2 not trashed")
 	}
-	if b.st.JournalSeq(mA) != 1 {
-		t.Fatalf("stored seq = %d, want reset to the accepted journal", b.st.JournalSeq(mA))
+	if b.st.JournalSeq(seqKey(projID, mA)) != 1 {
+		t.Fatalf("stored seq = %d, want reset to the accepted journal", b.st.JournalSeq(seqKey(projID, mA)))
 	}
 	wantAction(t, b.item(b.plan(Options{}), "f"), ActionInSync)
 }
@@ -1227,9 +1230,11 @@ func TestSummarize(t *testing.T) {
 		{Action: ActionReportOnly, Original: ActionDownload},
 		{Action: ActionReportOnly, Original: ActionUpload},
 		{Action: ActionReportOnly, Original: ActionMissingLocal}, // row 9
+		// Row 5: converging onto a tombstone changes nothing visible.
+		{Action: ActionConverge, Head: &FileRef{Kind: vault.KindDeleted}},
 	}}
 	got := Summarize(pp)
-	want := Summary{InSync: 1, LocalChanges: 3, RemoteChanges: 5, Conflicts: 1, Pending: 1, Rollback: 1, Missing: 2}
+	want := Summary{InSync: 2, LocalChanges: 3, RemoteChanges: 5, Conflicts: 1, Pending: 1, Rollback: 1, Missing: 2}
 	if got != want {
 		t.Fatalf("Summarize = %+v, want %+v", got, want)
 	}
@@ -1324,19 +1329,26 @@ func TestPlanWarningsAndSkips(t *testing.T) {
 		a.remove("target")
 		_ = os.Remove(a.abs("subdir"))
 	})
-	t.Run("invalid vault path is skipped", func(t *testing.T) {
-		bad := vault.Entry{Path: "../escape", Kind: vault.KindFile, Blob: a.v.BlobID([]byte("x")), Clock: vault.Clock{mA: 1}, Machine: mA}
-		j := &vault.Journal{Machine: mA, Entries: map[string]vault.Entry{"../escape": bad}}
-		if err := a.v.WriteJournal(projID, j); err != nil {
-			t.Fatal(err)
+	t.Run("invalid path is skipped", func(t *testing.T) {
+		// The vault validates entry paths itself (its own tests cover that),
+		// so the way an invalid path reaches the planner's path set is a
+		// tampered base store: it must be skipped with a warning and never
+		// resolved against the project directory.
+		blob := a.v.BlobID([]byte("x"))
+		invalid := []string{"../escape", "/abs", "a/../b", "./x", "a//b"}
+		for _, p := range invalid {
+			b.st.SetBase(projID, p, state.BaseEntry{Blob: blob, Kind: vault.KindFile, Clock: vault.Clock{mA: 1}})
 		}
 		pl := b.plan(Options{})
-		noItem(t, pl, "../escape")
+		for _, p := range invalid {
+			noItem(t, pl, p)
+			b.st.DeleteBase(projID, p)
+		}
 		if !hasWarning(pl.Projects[0].Warnings, "invalid path") {
 			t.Fatalf("warnings = %v", pl.Projects[0].Warnings)
 		}
-		if err := a.v.WriteJournal(projID, &vault.Journal{Machine: mA, Entries: map[string]vault.Entry{}}); err != nil {
-			t.Fatal(err)
+		if b.exists("../escape") {
+			t.Fatal("planner touched a path outside the project")
 		}
 	})
 	t.Run("unreadable journal", func(t *testing.T) {

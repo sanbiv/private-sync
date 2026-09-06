@@ -75,8 +75,14 @@ func (e *Engine) Apply(ctx context.Context, p *Plan, res Resolutions, opts Optio
 			pp.journalSeqs = map[string]uint64{}
 		}
 		ap := &applier{e: e, pp: pp, j: j, rep: rep, res: res, opts: opts, mode: p.Mode, bases: map[string]*state.BaseEntry{}}
+		// Cancellation between items abandons the project: its journal and
+		// base changes are never committed (spec §9.3), so the report must
+		// not count what the loop did either — blobs and local files written
+		// so far are simply reused by the next Plan/Apply.
+		committed := snapshotReport(rep)
 		for i := range pp.Items {
 			if err := ctx.Err(); err != nil {
+				*rep = committed
 				return rep, err
 			}
 			it := &pp.Items[i]
@@ -102,12 +108,18 @@ func (e *Engine) Apply(ctx context.Context, p *Plan, res Resolutions, opts Optio
 			}
 		}
 		for mid, seq := range pp.journalSeqs {
-			if seq > e.store.JournalSeq(mid) || opts.AcceptRollback || p.Mode == ModeRestore {
-				e.store.SetJournalSeq(mid, seq)
+			// The high-water mark is per (project, machine): see seqKey.
+			key := seqKey(pp.ID, mid)
+			if seq > e.store.JournalSeq(key) || opts.AcceptRollback || p.Mode == ModeRestore {
+				e.store.SetJournalSeq(key, seq)
 			}
 		}
 		if err := e.store.Save(); err != nil {
 			return rep, fmt.Errorf("sync.Apply: %w", err)
+		}
+		if err := e.writeMeta(pp.ID, opts.Meta); err != nil {
+			rep.Errors = append(rep.Errors, ItemError{Key: ItemKey{Project: pp.ID}, Err: err})
+			emit(opts.Progress, Event{Stage: "apply", Project: pp.ID, Message: "project meta not written", Done: done, Total: total, Err: err})
 		}
 		touched = true
 	}
@@ -123,6 +135,63 @@ func (e *Engine) Apply(ctx context.Context, p *Plan, res Resolutions, opts Optio
 	}
 	emit(opts.Progress, Event{Stage: "apply", Message: "apply complete", Done: done, Total: total})
 	return rep, nil
+}
+
+// snapshotReport copies a report (slices included) so a project abandoned by
+// cancellation can be rolled out of it.
+func snapshotReport(r *Report) Report {
+	out := *r
+	out.Unresolved = append([]ItemKey(nil), r.Unresolved...)
+	out.Errors = append([]ItemError(nil), r.Errors...)
+	return out
+}
+
+// writeMeta refreshes this machine's ProjectMeta from the Options.Meta hook
+// (spec §9.3: after a project's items, "meta (if changed)"). Nothing happens
+// without a hook or when it declines; otherwise the description is written
+// only when it differs from the stored one. A zero CreatedAt keeps the stored
+// creation time (or, for a first write, now). An unreadable stored meta is
+// simply rewritten: a machine only ever writes its own file.
+func (e *Engine) writeMeta(projectID string, hook func(string) (vault.ProjectMeta, bool)) error {
+	if hook == nil {
+		return nil
+	}
+	meta, ok := hook(projectID)
+	if !ok {
+		return nil
+	}
+	cur, err := e.vault.ReadProjectMeta(projectID, e.machine.ID)
+	if err != nil {
+		cur = nil
+	}
+	if meta.CreatedAt.IsZero() {
+		if cur != nil {
+			meta.CreatedAt = cur.CreatedAt
+		} else {
+			meta.CreatedAt = e.now()
+		}
+	}
+	if cur != nil && sameMeta(*cur, meta) {
+		return nil
+	}
+	if err := e.vault.WriteProjectMeta(projectID, e.machine.ID, meta); err != nil {
+		return fmt.Errorf("project meta: %w", err)
+	}
+	return nil
+}
+
+// sameMeta reports whether two project descriptions are equal (fingerprints
+// compared in order).
+func sameMeta(a, b vault.ProjectMeta) bool {
+	if a.Name != b.Name || len(a.Fingerprints) != len(b.Fingerprints) || !a.CreatedAt.Equal(b.CreatedAt) {
+		return false
+	}
+	for i := range a.Fingerprints {
+		if a.Fingerprints[i] != b.Fingerprints[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // applier holds the per-project state while applying.
@@ -457,13 +526,10 @@ func (ap *applier) download(it *Item) error {
 // reconcileMode applies the head's mode to an existing local file whose
 // content already matches, returning the fresh file info.
 func (ap *applier) reconcileMode(it *Item, info fs.FileInfo) (fs.FileInfo, error) {
-	if it.Head == nil || it.Head.Mode == 0 {
+	if it.Head == nil || info == nil || !modeDiffers(uint32(info.Mode().Perm()), it.Head.Mode) {
 		return info, nil
 	}
 	want := fs.FileMode(it.Head.Mode) & fs.ModePerm
-	if info.Mode().Perm() == want {
-		return info, nil
-	}
 	abs := ap.abs(it.Key.Path)
 	if err := os.Chmod(abs, want); err != nil {
 		return nil, err

@@ -64,14 +64,22 @@ func answer(yes bool) func(string, bool) (bool, error) {
 // fakeRemote is a scriptable Remote: pushErr fails Push, onFetch runs on
 // every Fetch (1-based call number) and may fail it or rewrite the vault dir.
 type fakeRemote struct {
-	pushErr error
-	onFetch func(call int) error
-	pushes  [][]string
-	fetches int
+	pushErr   error
+	onFetch   func(call int) error
+	onPrepare func() error
+	pushes    [][]string
+	fetches   int
+	prepared  int
 }
 
-func (r *fakeRemote) Name() string                                { return "fake" }
-func (r *fakeRemote) Prepare(context.Context, func(string)) error { return nil }
+func (r *fakeRemote) Name() string { return "fake" }
+func (r *fakeRemote) Prepare(context.Context, func(string)) error {
+	r.prepared++
+	if r.onPrepare != nil {
+		return r.onPrepare()
+	}
+	return nil
+}
 func (r *fakeRemote) Fetch(context.Context, func(string)) error {
 	r.fetches++
 	if r.onFetch != nil {
@@ -362,6 +370,28 @@ func TestOpen(t *testing.T) {
 		}
 		if o.State == nil || o.Engine == nil || o.Remote == nil {
 			t.Fatal("session incomplete")
+		}
+	})
+	t.Run("never fetches, prepares once", func(t *testing.T) {
+		f := newFixture(t)
+		s, _ := f.setup(t, "correct horse")
+		s.Close()
+		a := f.load(t)
+		rem := &fakeRemote{}
+		useRemote(a, rem)
+		o, err := a.Open(context.Background(), &fixedPrompter{pass: "correct horse"})
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		o.Close()
+		if rem.fetches != 0 {
+			t.Fatalf("Open fetched %d times, want 0 (spec §12: NO fetch)", rem.fetches)
+		}
+		if rem.prepared != 1 {
+			t.Fatalf("Open prepared %d times, want 1", rem.prepared)
+		}
+		if len(rem.pushes) != 0 {
+			t.Fatalf("Open pushed: %v", rem.pushes)
 		}
 	})
 	t.Run("open pins when no pin exists", func(t *testing.T) {
@@ -1377,6 +1407,29 @@ func TestLinkProject(t *testing.T) {
 	}
 	if err := s.LinkProject(context.Background(), "bbbbbbbbbbbbbbbb", "x", "", fps); err == nil {
 		t.Fatal("want error for empty dir")
+	}
+	// A missing or non-directory path is refused before anything is written:
+	// a typo must not reach config.yaml and surface later as "path missing".
+	before := len(s.Config.Projects)
+	missing := filepath.Join(f.root, "does-not-exist")
+	err = s.LinkProject(context.Background(), "bbbbbbbbbbbbbbbb", "x", missing, fps)
+	if !errors.Is(err, os.ErrNotExist) || !strings.Contains(err.Error(), missing) {
+		t.Fatalf("link missing dir: want ErrNotExist naming %s, got %v", missing, err)
+	}
+	notDir := filepath.Join(f.root, "a-file")
+	writeFile(t, notDir, "x")
+	err = s.LinkProject(context.Background(), "bbbbbbbbbbbbbbbb", "x", notDir, fps)
+	if err == nil || !strings.Contains(err.Error(), "not a directory") {
+		t.Fatalf("link a file: want 'not a directory', got %v", err)
+	}
+	if len(s.Config.Projects) != before {
+		t.Fatalf("config changed by a refused link: %+v", s.Config.Projects)
+	}
+	if _, ok := s.Config.Project("bbbbbbbbbbbbbbbb"); ok {
+		t.Fatal("refused project was added to the config")
+	}
+	if _, _, err := s.Vault.ReadProject("bbbbbbbbbbbbbbbb"); !errors.Is(err, vault.ErrNoProject) {
+		t.Fatalf("refused project reached the vault: %v", err)
 	}
 	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()

@@ -2,7 +2,11 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/table"
@@ -171,7 +175,12 @@ func (m *detailModel) handleKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 		m.confirm = &detailConfirm{
 			message: "Restore every tracked file in this project from the vault?",
 			run: func() tea.Cmd {
-				m.startSync(sync.Options{Mode: sync.ModeRestore, Projects: []string{m.projectID}}, stagePlan, true, true)
+				// Start at stageFetch (not stagePlan): restore is network=yes
+				// (spec §2.1) and planning against a stale local vault copy
+				// could restore an old remote head over the user's files.
+				// Pre-images still go to the trash first, so this is
+				// recoverable even so, but fetching first avoids it.
+				m.startSync(sync.Options{Mode: sync.ModeRestore, Projects: []string{m.projectID}}, stageFetch, true, true)
 				return m.sv.Init()
 			},
 		}
@@ -220,6 +229,13 @@ func (m *detailModel) handleKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 					m.err = err.Error()
 					return nil
 				}
+				// DeleteEverywhere alone leaves the local plaintext file in
+				// place (internal/sync/ops.go); mirror cmd_files.filesDelete
+				// so the confirm text above ("trashed locally, removed from
+				// the vault") is actually true and the next plan does not
+				// show this path stuck forever as "deleted in the vault,
+				// present locally".
+				m.trashAndRemoveLocal(path)
 				m.startSync(sync.Options{}, stagePush, false, true)
 				return m.sv.Init()
 			},
@@ -229,6 +245,37 @@ func (m *detailModel) handleKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 		var cmd tea.Cmd
 		m.tbl, cmd = m.tbl.Update(msg)
 		return false, cmd
+	}
+}
+
+// trashAndRemoveLocal saves path's on-disk content (relative to the project
+// directory) to the encrypted trash and removes it, matching what the CLI's
+// `files delete` does (internal/cli/cmd_files.go filesDelete) after
+// Engine.DeleteEverywhere. A missing or non-regular file is left alone
+// (nothing to trash); trash or removal failures are reported via m.err but
+// do not stop the caller from proceeding to push the tombstone.
+func (m *detailModel) trashAndRemoveLocal(path string) {
+	full := filepath.Join(m.projectPath, filepath.FromSlash(path))
+	st, err := os.Lstat(full)
+	if err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			m.err = err.Error()
+		}
+		return
+	}
+	if !st.Mode().IsRegular() {
+		return
+	}
+	content, err := os.ReadFile(full)
+	if err != nil {
+		m.err = fmt.Sprintf("%s: could not read local copy: %v", path, err)
+		return
+	}
+	if _, err := m.s.State.TrashPut(m.s.Vault.Keys(), m.projectID, path, content, uint32(st.Mode().Perm())); err != nil {
+		m.err = fmt.Sprintf("%s: could not save a copy in the trash: %v", path, err)
+	}
+	if err := os.Remove(full); err != nil {
+		m.err = fmt.Sprintf("%s: %v", path, err)
 	}
 }
 

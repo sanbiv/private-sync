@@ -200,8 +200,17 @@ func (m *settingsModel) updateForm(msg tea.Msg) (bool, tea.Cmd) {
 		return true, cmd
 	case huh.StateCompleted:
 		if err := m.save(); err != nil {
+			// huh v1's Form.Update is a no-op once State != StateNormal, so
+			// leaving m.form as-is here would leave the screen permanently
+			// stuck at StateCompleted with a visible error but no field the
+			// user can edit (only esc, which discards everything they typed).
+			// Rebuilding the form re-reads the still-populated m.* fields
+			// (save() only ever mutates a copy of the config, never them),
+			// so the typed values survive and the user can fix the one that
+			// failed validation.
 			m.err = err.Error()
-			return false, cmd
+			m.form = m.buildForm()
+			return false, tea.Batch(cmd, m.form.Init())
 		}
 		if m.wantRekey {
 			m.rekeyForm = m.buildRekeyForm()

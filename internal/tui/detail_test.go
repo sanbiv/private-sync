@@ -2,6 +2,9 @@ package tui
 
 import (
 	"context"
+	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -106,6 +109,100 @@ func TestDetailHandleKeyROpensRestoreConfirm(t *testing.T) {
 	m.Update(tea.KeyMsg{Type: tea.KeyEsc})
 	if m.confirm != nil {
 		t.Fatalf("esc should cancel the confirm prompt like n")
+	}
+}
+
+// TestDetailHandleKeyRStartsAtFetch is the regression for restore skipping
+// the fetch: restore is network=yes (spec §2.1), so confirming R must start
+// the pipeline at stageFetch, not stagePlan against a possibly-stale local
+// vault copy.
+func TestDetailHandleKeyRStartsAtFetch(t *testing.T) {
+	m, _ := newTestDetail(t)
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("R")})
+	if m.confirm == nil {
+		t.Fatalf("R should open a confirm prompt")
+	}
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	if !m.svActive || m.sv == nil {
+		t.Fatalf("confirming R should start a syncView")
+	}
+	if m.sv.stage != stageFetch {
+		t.Fatalf("sv.stage = %v, want stageFetch (restore must fetch first)", m.sv.stage)
+	}
+	if m.sv.opts.Mode != sync.ModeRestore {
+		t.Fatalf("sv.opts.Mode = %v, want ModeRestore", m.sv.opts.Mode)
+	}
+}
+
+// TestDetailHandleKeyDTrashesAndRemovesLocalFile is the regression for "D"
+// promising "trashed locally, removed from the vault" while only removing it
+// from the vault: Engine.DeleteEverywhere alone leaves the plaintext file on
+// disk (internal/sync/ops.go), so confirming D must also move the local copy
+// to the encrypted trash and delete it, exactly like the CLI's `files delete`
+// (internal/cli/cmd_files.go).
+func TestDetailHandleKeyDTrashesAndRemovesLocalFile(t *testing.T) {
+	s := newTestSession(t)
+	dir := t.TempDir()
+	s.Config.AddProject(config.ProjectConfig{ID: "proj1", Name: "Proj One", Path: dir})
+
+	// Track a.env in the vault (writeTrackedFiles, addproject_test.go) so
+	// Engine.DeleteEverywhere's "tracked" precondition holds, and create the
+	// matching local file so there is something for trashAndRemoveLocal to
+	// move to the trash.
+	writeTrackedFiles(t, s, "proj1", map[string]string{"a.env": "SECRET=1"})
+	full := filepath.Join(dir, "a.env")
+	if err := os.WriteFile(full, []byte("SECRET=1"), 0o600); err != nil {
+		t.Fatalf("write local file: %v", err)
+	}
+
+	m, err := newDetailModel(context.Background(), s, "proj1", "Proj One")
+	if err != nil {
+		t.Fatalf("newDetailModel: %v", err)
+	}
+	m.setPlan(&sync.Plan{Projects: []sync.ProjectPlan{{
+		ID: "proj1",
+		Items: []sync.Item{
+			{Key: sync.ItemKey{Project: "proj1", Path: "a.env"}, Action: sync.ActionInSync},
+		},
+	}}})
+
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("D")})
+	if m.confirm == nil {
+		t.Fatalf("D should open a confirm prompt")
+	}
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	if m.err != "" {
+		t.Fatalf("unexpected error after confirming D: %s", m.err)
+	}
+	if cmd == nil {
+		t.Fatalf("confirming D should return the syncView's Init() command")
+	}
+	if _, err := os.Stat(full); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("local copy should have been removed after D, stat err = %v", err)
+	}
+	entries, err := s.State.TrashList()
+	if err != nil {
+		t.Fatalf("TrashList: %v", err)
+	}
+	found := false
+	for _, e := range entries {
+		if e.Project == "proj1" && e.Path == "a.env" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("trash entries = %+v, want one for proj1/a.env", entries)
+	}
+}
+
+// TestDetailTrashAndRemoveLocalMissingFileIsNoop covers the case where the
+// local file is already gone by the time D runs: nothing to trash, and no
+// error should be raised.
+func TestDetailTrashAndRemoveLocalMissingFileIsNoop(t *testing.T) {
+	m, _ := newTestDetail(t)
+	m.trashAndRemoveLocal("does-not-exist.env")
+	if m.err != "" {
+		t.Fatalf("trashAndRemoveLocal on a missing file should not set m.err, got %q", m.err)
 	}
 }
 

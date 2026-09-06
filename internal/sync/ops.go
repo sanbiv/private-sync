@@ -11,8 +11,9 @@ import (
 
 // Untrack writes a KindUntracked tombstone for paths (files rm): the vault
 // stops syncing them everywhere, local copies are never touched. The base
-// entries are dropped. Every path must be tracked (in the vault or in this
-// machine's base store), otherwise ErrNotTracked and nothing is written.
+// entries are dropped. Every path must be tracked (see tracked), otherwise
+// ErrNotTracked and nothing is written. Journal warnings (stray files, spec
+// §5) go to the SetWarningHandler handler.
 func (e *Engine) Untrack(ctx context.Context, projectID string, paths []string) error {
 	return e.writeTombstones(ctx, projectID, paths, vault.KindUntracked)
 }
@@ -21,8 +22,42 @@ func (e *Engine) Untrack(ctx context.Context, projectID string, paths []string) 
 // The local file is left in place here (the caller may remove it); the base
 // becomes the tombstone, so the next Plan reports a surviving local copy
 // (row 9) instead of re-uploading it, and other machines trash their copies.
+// Every path must be tracked (see tracked): in particular a path already
+// untracked in the vault is refused with ErrNotTracked, because a tombstone
+// dominating the untracked entry would turn the local copies the untrack
+// deliberately left in place into modify/delete conflicts everywhere.
+// Journal warnings (stray files, spec §5) go to the SetWarningHandler handler.
 func (e *Engine) DeleteEverywhere(ctx context.Context, projectID string, paths []string) error {
 	return e.writeTombstones(ctx, projectID, paths, vault.KindDeleted)
+}
+
+// tracked reports whether a path may receive a tombstone: its vault head is
+// a file (a single one, or any file candidate of a concurrent head), or the
+// vault has no entry for it and this machine still holds a base (the journal
+// was lost: re-publish or untrack are both meaningful). A head that is a
+// tombstone already says the path is not tracked: an untracked head is never
+// overridden (its local copies must stay untouched), a deleted head only by
+// a machine that has not synced the deletion yet (file base), where another
+// tombstone is harmless.
+func tracked(h vault.Head, hasHead bool, base state.BaseEntry, hasBase bool) bool {
+	if !hasHead {
+		return hasBase
+	}
+	if h.Entry == nil {
+		for _, c := range h.Candidates {
+			if c.Kind == vault.KindFile {
+				return true
+			}
+		}
+		return false
+	}
+	switch h.Entry.Kind {
+	case vault.KindFile:
+		return true
+	case vault.KindDeleted:
+		return hasBase && base.Kind == vault.KindFile
+	}
+	return false
 }
 
 // writeTombstones is the shared implementation of Untrack/DeleteEverywhere.
@@ -55,19 +90,18 @@ func (e *Engine) writeTombstones(ctx context.Context, projectID string, paths []
 	if len(list) == 0 {
 		return nil
 	}
-	journals, _, err := e.vault.ReadJournals(projectID)
+	journals, warnings, err := e.vault.ReadJournals(projectID)
+	e.warnAll(projectID, warnings)
 	if err != nil {
 		return fmt.Errorf("%s: %w", op, err)
 	}
 	heads := vault.ResolveHeads(journals)
 	for _, p := range list {
-		if _, ok := heads[p]; ok {
-			continue
+		h, hasHead := heads[p]
+		b, hasBase := e.store.Base(projectID, p)
+		if !tracked(h, hasHead, b, hasBase) {
+			return fmt.Errorf("%s: %w: %s", op, ErrNotTracked, p)
 		}
-		if _, ok := e.store.Base(projectID, p); ok {
-			continue
-		}
-		return fmt.Errorf("%s: %w: %s", op, ErrNotTracked, p)
 	}
 	j := journals[e.machine.ID]
 	if j == nil {
@@ -124,7 +158,7 @@ func (e *Engine) writeTombstones(ctx context.Context, projectID string, paths []
 			e.store.DeleteBase(projectID, d.path)
 		}
 	}
-	e.store.SetJournalSeq(e.machine.ID, j.Seq)
+	e.store.SetJournalSeq(seqKey(projectID, e.machine.ID), j.Seq)
 	if err := e.store.Save(); err != nil {
 		return fmt.Errorf("%s: %w", op, err)
 	}
@@ -132,7 +166,8 @@ func (e *Engine) writeTombstones(ctx context.Context, projectID string, paths []
 }
 
 // TrackedPaths returns the paths whose vault head is a file (for scan/restore).
-// A concurrent head counts as tracked when any candidate is a file.
+// A concurrent head counts as tracked when any candidate is a file. Journal
+// warnings (stray files, spec §5) go to the SetWarningHandler handler.
 func (e *Engine) TrackedPaths(projectID string) (map[string]bool, error) {
 	if err := e.ready(); err != nil {
 		return nil, fmt.Errorf("sync.TrackedPaths: %w", err)
@@ -140,7 +175,8 @@ func (e *Engine) TrackedPaths(projectID string) (map[string]bool, error) {
 	if projectID == "" {
 		return nil, errors.New("sync.TrackedPaths: empty project id")
 	}
-	journals, _, err := e.vault.ReadJournals(projectID)
+	journals, warnings, err := e.vault.ReadJournals(projectID)
+	e.warnAll(projectID, warnings)
 	if err != nil {
 		return nil, fmt.Errorf("sync.TrackedPaths: %w", err)
 	}

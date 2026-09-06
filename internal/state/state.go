@@ -9,8 +9,18 @@
 //	vaults/<vaultID>/trash/<aa>/<blob>.enc   deterministic blob ciphertext (crypto.Keys.SealBlob)
 //
 // Every write goes through fsutil.WriteFileAtomic so a crash never leaves a
-// half-written file behind. Plaintext never touches the state directory: trash
-// pre-images are stored as ciphertext only.
+// half-written file behind. Temp files carry a writer-unique suffix
+// ("state-<pid>" for machine.json, "state-<pid>-<random>" per Store handle) so
+// concurrent writers — two goroutines, or a cli and a tui process — never share
+// a temp name; Open sweeps stale temp files left by crashed writers.
+//
+// Read-modify-write cycles that span processes (pinning in machine.json,
+// appending to or purging the trash index, Save) are serialised by an advisory
+// lock file — <stateDir>/lock for machine.json and vaults/<vaultID>/lock for a
+// store — so a cli and a tui working on the same vault never drop each other's
+// rows. The lock is held only for the duration of one such cycle. Plaintext
+// never touches the state directory: trash pre-images are stored as ciphertext
+// only.
 package state
 
 import (
@@ -21,6 +31,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -45,14 +56,87 @@ const (
 	trashIndexFile = "index.json"
 	// trashBlobExt is the extension of encrypted trash blobs.
 	trashBlobExt = ".enc"
-	// writeSuffix identifies this package's temp files (fsutil suffix).
-	writeSuffix = "state"
+	// suffixPrefix starts every temp-file suffix of this package (fsutil suffix).
+	// The full suffix is suffixPrefix+"<pid>" (machine.json) or
+	// suffixPrefix+"<pid>-<hex>" (per Store handle).
+	suffixPrefix = "state-"
 	// trashIDBytes is the number of random bytes in a trash entry id (12 hex chars).
 	trashIDBytes = 6
+	// handleSuffixBytes is the number of random bytes in a Store handle suffix.
+	handleSuffixBytes = 4
+	// staleTempAge is how old a temp file of another process must be before
+	// Open treats it as the leftover of a crashed writer and removes it. An
+	// atomic write takes milliseconds; the margin covers suspended machines.
+	staleTempAge = time.Hour
 
 	dirMode  fs.FileMode = 0o700
 	fileMode fs.FileMode = 0o600
 )
+
+// processSuffix is the temp-file suffix used by process-wide writers
+// (machine.json). It is unique per process so two private-sync processes on
+// the same machine never collide on a temp name.
+var processSuffix = suffixPrefix + strconv.Itoa(os.Getpid())
+
+// tempMarker is the substring every temp file of this package carries in its
+// name, whatever the writer.
+const tempMarker = fsutil.TempPrefix + suffixPrefix
+
+// newHandleSuffix returns a fresh writer suffix for one Store handle:
+// "state-<pid>-<8 hex chars>". Two handles of the same vault in one process
+// (a live session plus a one-shot command) therefore write distinct temp files.
+func newHandleSuffix() string {
+	hex, err := crypto.RandomHex(handleSuffixBytes)
+	if err != nil || hex == "" {
+		// Fall back to a wall-clock stamp: still unique enough within a process.
+		hex = strconv.FormatInt(time.Now().UnixNano(), 36)
+	}
+	return processSuffix + "-" + hex
+}
+
+// isOwnProcessTemp reports whether name is a temp file of this package written
+// by this process (suffix "state-<pid>" or "state-<pid>-…").
+func isOwnProcessTemp(name string) bool {
+	i := strings.LastIndex(name, tempMarker)
+	if i < 0 {
+		return false
+	}
+	rest := name[i+len(tempMarker):]
+	pid := strconv.Itoa(os.Getpid())
+	return rest == pid || strings.HasPrefix(rest, pid+"-")
+}
+
+// removeStaleTemp deletes temp files of this package below root that were left
+// behind by other, presumably crashed, writers: files carrying tempMarker that
+// belong to another process and are older than staleTempAge. Files of the
+// running process are never touched (another handle may be mid-write), and
+// young files of other processes are assumed in flight. With recursive false
+// only the files directly inside root are inspected. Errors are swallowed:
+// cleanup is best effort and must never block opening the store.
+func removeStaleTemp(root string, recursive bool) {
+	cutoff := time.Now().Add(-staleTempAge)
+	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d == nil {
+			return nil
+		}
+		if d.IsDir() {
+			if !recursive && p != root {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		name := d.Name()
+		if !strings.Contains(name, tempMarker) || isOwnProcessTemp(name) {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil || info.ModTime().After(cutoff) {
+			return nil
+		}
+		_ = os.Remove(p)
+		return nil
+	})
+}
 
 // Machine is this computer's identity (never stored in config.yaml).
 type Machine struct {
@@ -61,7 +145,9 @@ type Machine struct {
 }
 
 // ErrVaultMismatch is returned when a vault id differs from the pinned one.
-var ErrVaultMismatch = errors.New("the vault at this path has a different id than the one previously used on this machine")
+// The text carries the remedy prescribed by spec §9.4 so every wrapper
+// (fmt.Errorf with %w) inherits it.
+var ErrVaultMismatch = errors.New("remote already contains a different vault than the one pinned for this path; run init and choose open, or delete the local copy")
 
 // machineDoc is the on-disk shape of machine.json.
 type machineDoc struct {
@@ -71,8 +157,19 @@ type machineDoc struct {
 }
 
 // machineMu serialises read-modify-write cycles on machine.json within this
-// process (LoadMachine on first use, PinVault).
+// process (LoadMachine on first use, PinVault); lockMachine extends that
+// across processes.
 var machineMu sync.Mutex
+
+// lockMachine takes the cross-process lock for machine.json
+// (<stateDir>/lock). Callers must hold machineMu and Unlock the result.
+func lockMachine(stateDir string) (*dirLock, error) {
+	l, err := lockDir(stateDir)
+	if err != nil {
+		return nil, fmt.Errorf("state: %w", err)
+	}
+	return l, nil
+}
 
 // machinePath returns <stateDir>/machine.json.
 func machinePath(stateDir string) string { return filepath.Join(stateDir, machineFile) }
@@ -113,7 +210,7 @@ func writeMachineDoc(stateDir string, doc machineDoc) error {
 		return fmt.Errorf("state: encode %s: %w", machineFile, err)
 	}
 	data = append(data, '\n')
-	if err := fsutil.WriteFileAtomic(machinePath(stateDir), data, fileMode, writeSuffix); err != nil {
+	if err := fsutil.WriteFileAtomic(machinePath(stateDir), data, fileMode, processSuffix); err != nil {
 		return fmt.Errorf("state: write %s: %w", machineFile, err)
 	}
 	return nil
@@ -151,6 +248,18 @@ func LoadMachine(stateDir string) (Machine, error) {
 	}
 	machineMu.Lock()
 	defer machineMu.Unlock()
+	removeStaleTemp(stateDir, false)
+	// Fast path: an existing, valid identity needs no lock.
+	if doc, ok, err := readMachineDoc(stateDir); err != nil {
+		return Machine{}, err
+	} else if ok {
+		return Machine{ID: doc.ID, CreatedAt: doc.CreatedAt}, nil
+	}
+	l, err := lockMachine(stateDir)
+	if err != nil {
+		return Machine{}, err
+	}
+	defer l.Unlock()
 	doc, err := loadOrCreateMachineDoc(stateDir)
 	if err != nil {
 		return Machine{}, err
@@ -158,12 +267,17 @@ func LoadMachine(stateDir string) (Machine, error) {
 	return Machine{ID: doc.ID, CreatedAt: doc.CreatedAt}, nil
 }
 
-// cleanVaultPath normalises a vault path for use as a pin key.
-func cleanVaultPath(vaultPath string) string {
-	if vaultPath == "" {
-		return ""
+// cleanVaultPath normalises a vault path for use as a pin key. Spec §9.4 keys
+// pins by absolute path, so relative paths are rejected: they would produce a
+// cwd-dependent key that never matches again.
+func cleanVaultPath(vaultPath string) (string, error) {
+	if strings.TrimSpace(vaultPath) == "" {
+		return "", errors.New("empty vault path")
 	}
-	return filepath.Clean(vaultPath)
+	if !filepath.IsAbs(vaultPath) {
+		return "", fmt.Errorf("vault path must be absolute: %q", vaultPath)
+	}
+	return filepath.Clean(vaultPath), nil
 }
 
 // PinnedVault returns the vault id pinned for an absolute vault path.
@@ -171,9 +285,9 @@ func PinnedVault(stateDir, vaultPath string) (string, bool, error) {
 	if stateDir == "" {
 		return "", false, errors.New("state.PinnedVault: empty state dir")
 	}
-	key := cleanVaultPath(vaultPath)
-	if key == "" {
-		return "", false, errors.New("state.PinnedVault: empty vault path")
+	key, err := cleanVaultPath(vaultPath)
+	if err != nil {
+		return "", false, fmt.Errorf("state.PinnedVault: %w", err)
 	}
 	machineMu.Lock()
 	defer machineMu.Unlock()
@@ -196,15 +310,20 @@ func PinVault(stateDir, vaultPath, vaultID string) error {
 	if stateDir == "" {
 		return errors.New("state.PinVault: empty state dir")
 	}
-	key := cleanVaultPath(vaultPath)
-	if key == "" {
-		return errors.New("state.PinVault: empty vault path")
+	key, err := cleanVaultPath(vaultPath)
+	if err != nil {
+		return fmt.Errorf("state.PinVault: %w", err)
 	}
 	if vaultID == "" {
 		return errors.New("state.PinVault: empty vault id")
 	}
 	machineMu.Lock()
 	defer machineMu.Unlock()
+	l, err := lockMachine(stateDir)
+	if err != nil {
+		return err
+	}
+	defer l.Unlock()
 	doc, err := loadOrCreateMachineDoc(stateDir)
 	if err != nil {
 		return err
@@ -221,12 +340,20 @@ func UnpinVault(stateDir, vaultPath string) error {
 	if stateDir == "" {
 		return errors.New("state.UnpinVault: empty state dir")
 	}
-	key := cleanVaultPath(vaultPath)
-	if key == "" {
-		return errors.New("state.UnpinVault: empty vault path")
+	key, err := cleanVaultPath(vaultPath)
+	if err != nil {
+		return fmt.Errorf("state.UnpinVault: %w", err)
 	}
 	machineMu.Lock()
 	defer machineMu.Unlock()
+	if !fsutil.Exists(machinePath(stateDir)) {
+		return nil // nothing pinned anywhere; do not create the dir for a no-op
+	}
+	l, err := lockMachine(stateDir)
+	if err != nil {
+		return err
+	}
+	defer l.Unlock()
 	doc, ok, err := readMachineDoc(stateDir)
 	if err != nil {
 		return err
@@ -290,6 +417,9 @@ type Store struct {
 	mu       sync.Mutex
 	projects map[string]map[string]BaseEntry
 	journals map[string]uint64
+
+	// suffix is this handle's fsutil temp-file suffix ("state-<pid>-<hex>").
+	suffix string
 }
 
 // validVaultID rejects ids that could escape the vaults directory.
@@ -323,7 +453,11 @@ func Open(stateDir, vaultID string) (*Store, error) {
 		dir:      dir,
 		projects: map[string]map[string]BaseEntry{},
 		journals: map[string]uint64{},
+		suffix:   newHandleSuffix(),
 	}
+	// Spec §13: stale own temp files are swept; the state dir is local-only,
+	// so every temp file below it is ours (see removeStaleTemp for the rules).
+	removeStaleTemp(dir, true)
 	data, err := os.ReadFile(s.basePath())
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -354,8 +488,26 @@ func Open(stateDir, vaultID string) (*Store, error) {
 	return s, nil
 }
 
-// Dir returns the store directory.
-func (s *Store) Dir() string { return s.dir }
+// Dir returns the store directory ("" for a nil store).
+func (s *Store) Dir() string {
+	if s == nil {
+		return ""
+	}
+	return s.dir
+}
+
+// TempSuffix returns the fsutil temp-file suffix this handle writes with
+// ("state-<pid>-<hex>"; "" for a nil store). Exposed for diagnostics and tests.
+func (s *Store) TempSuffix() string {
+	if s == nil {
+		return ""
+	}
+	return s.suffix
+}
+
+// lock takes the cross-process lock of this store (<store dir>/lock).
+// Callers must hold s.mu and Unlock the result.
+func (s *Store) lock() (*dirLock, error) { return lockDir(s.dir) }
 
 func (s *Store) basePath() string       { return filepath.Join(s.dir, baseFile) }
 func (s *Store) trashPath() string      { return filepath.Join(s.dir, trashDir) }
@@ -446,7 +598,8 @@ func (s *Store) DeleteProject(project string) {
 	delete(s.projects, project)
 }
 
-// JournalSeq returns the highest journal sequence applied for a machine (0 when unknown).
+// JournalSeq returns the journal sequence recorded for a machine: the point
+// the sync engine resumes that machine's journal from (0 when unknown).
 func (s *Store) JournalSeq(machine string) uint64 {
 	if s == nil {
 		return 0
@@ -456,7 +609,11 @@ func (s *Store) JournalSeq(machine string) uint64 {
 	return s.journals[machine]
 }
 
-// SetJournalSeq records the highest journal sequence applied for a machine.
+// SetJournalSeq records the journal sequence to resume a machine's journal
+// from. It overwrites unconditionally: the value may go backwards when the sync
+// engine accepts a journal rollback (or restores a project) and deliberately
+// resets its reference point. Callers that only ever want the watermark to
+// grow use AdvanceJournalSeq.
 func (s *Store) SetJournalSeq(machine string, seq uint64) {
 	if s == nil || machine == "" {
 		return
@@ -464,6 +621,22 @@ func (s *Store) SetJournalSeq(machine string, seq uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.journals[machine] = seq
+}
+
+// AdvanceJournalSeq raises the recorded sequence of a machine to seq when seq
+// is higher than the current value and reports whether it changed anything. A
+// lower seq never regresses the watermark; use SetJournalSeq for that.
+func (s *Store) AdvanceJournalSeq(machine string, seq uint64) bool {
+	if s == nil || machine == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if seq <= s.journals[machine] {
+		return false
+	}
+	s.journals[machine] = seq
+	return true
 }
 
 // JournalSeqs returns a copy of every recorded journal sequence.
@@ -482,11 +655,18 @@ func (s *Store) JournalSeqs() map[string]uint64 {
 
 // Save writes base.json atomically (0600). Map keys are emitted sorted by
 // encoding/json, so the output is stable for identical state.
+//
+// The store mutex is held for the whole snapshot + write: two Saves on one
+// handle (a TUI action racing an Apply) are serialised, so the file always
+// holds the newest snapshot and the temp file is never opened twice at once.
+// The cross-process lock is taken around the write as well so Saves of
+// different handles or processes land in a well-defined order.
 func (s *Store) Save() error {
 	if s == nil {
 		return errors.New("state.Save: nil store")
 	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	doc := baseDoc{
 		Projects: make(map[string]map[string]BaseEntry, len(s.projects)),
 		Journals: make(map[string]uint64, len(s.journals)),
@@ -504,17 +684,18 @@ func (s *Store) Save() error {
 	for m, seq := range s.journals {
 		doc.Journals[m] = seq
 	}
-	s.mu.Unlock()
 
 	data, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
 		return fmt.Errorf("state.Save: encode: %w", err)
 	}
 	data = append(data, '\n')
-	if err := ensureDir(s.dir); err != nil {
+	l, err := s.lock()
+	if err != nil {
 		return fmt.Errorf("state.Save: %w", err)
 	}
-	if err := fsutil.WriteFileAtomic(s.basePath(), data, fileMode, writeSuffix); err != nil {
+	defer l.Unlock()
+	if err := fsutil.WriteFileAtomic(s.basePath(), data, fileMode, s.suffix); err != nil {
 		return fmt.Errorf("state.Save: write %s: %w", baseFile, err)
 	}
 	return nil
@@ -523,7 +704,7 @@ func (s *Store) Save() error {
 // TrashEntry indexes one encrypted pre-image.
 type TrashEntry struct {
 	ID      string    `json:"id"`
-	Time    time.Time `json:"time"`
+	Time    time.Time `json:"ts"` // spec §9.4 index row key "ts"
 	Project string    `json:"project"`
 	Path    string    `json:"path"`
 	Blob    string    `json:"blob"`
@@ -580,7 +761,7 @@ func (s *Store) writeTrashIndex(entries []TrashEntry) error {
 	if err := ensureDir(s.trashPath()); err != nil {
 		return err
 	}
-	if err := fsutil.WriteFileAtomic(s.trashIndexPath(), data, fileMode, writeSuffix); err != nil {
+	if err := fsutil.WriteFileAtomic(s.trashIndexPath(), data, fileMode, s.suffix); err != nil {
 		return fmt.Errorf("write trash index: %w", err)
 	}
 	return nil
@@ -606,6 +787,20 @@ func (s *Store) TrashPut(k *crypto.Keys, project, path string, content []byte, m
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// The index is read-modify-written below; the cross-process lock keeps a
+	// concurrent TrashPut/TrashPurge of another process from dropping rows.
+	l, err := s.lock()
+	if err != nil {
+		return TrashEntry{}, fmt.Errorf("state.TrashPut: %w", err)
+	}
+	defer l.Unlock()
+
+	// Read the index first: a corrupt index must fail before a blob is written,
+	// otherwise the blob would be orphaned (no row references it).
+	entries, err := s.readTrashIndex()
+	if err != nil {
+		return TrashEntry{}, fmt.Errorf("state.TrashPut: %w", err)
+	}
 
 	blob, ciphertext, err := k.SealBlob(content)
 	if err != nil {
@@ -618,17 +813,14 @@ func (s *Store) TrashPut(k *crypto.Keys, project, path string, content []byte, m
 	if err := ensureDir(filepath.Dir(blobPath)); err != nil {
 		return TrashEntry{}, fmt.Errorf("state.TrashPut: %w", err)
 	}
-	// Identical pre-images share one file: the format is deterministic.
+	// Identical pre-images share one file: the format is deterministic, so a
+	// concurrent writer of the same blob produces byte-identical content.
 	if !fsutil.Exists(blobPath) {
-		if err := fsutil.WriteFileAtomic(blobPath, ciphertext, fileMode, writeSuffix); err != nil {
+		if err := fsutil.WriteFileAtomic(blobPath, ciphertext, fileMode, s.suffix); err != nil {
 			return TrashEntry{}, fmt.Errorf("state.TrashPut: write blob: %w", err)
 		}
 	}
 
-	entries, err := s.readTrashIndex()
-	if err != nil {
-		return TrashEntry{}, fmt.Errorf("state.TrashPut: %w", err)
-	}
 	used := make(map[string]bool, len(entries))
 	for _, e := range entries {
 		used[e.ID] = true
@@ -732,6 +924,11 @@ func (s *Store) TrashPurge(olderThan time.Duration) (int, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	l, err := s.lock()
+	if err != nil {
+		return 0, fmt.Errorf("state.TrashPurge: %w", err)
+	}
+	defer l.Unlock()
 	entries, err := s.readTrashIndex()
 	if err != nil {
 		return 0, fmt.Errorf("state.TrashPurge: %w", err)
@@ -775,10 +972,10 @@ func (s *Store) TrashPurge(olderThan time.Duration) (int, error) {
 			if firstErr == nil {
 				firstErr = fmt.Errorf("state.TrashPurge: remove blob %s: %w", e.Blob, err)
 			}
-			continue
 		}
-		// Drop the shard directory once empty (ignore failures: it may hold other blobs).
-		_ = os.Remove(filepath.Dir(blobPath))
+		// The (possibly empty) shard directory is deliberately kept: removing it
+		// could race a TrashPut in another process between its ensureDir and
+		// its blob write, and an empty two-character directory is harmless.
 	}
 	return len(removed), firstErr
 }

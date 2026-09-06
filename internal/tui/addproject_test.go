@@ -5,10 +5,12 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/sanbiv/private-sync/internal/app"
 	"github.com/sanbiv/private-sync/internal/identity"
@@ -114,6 +116,25 @@ func TestCleanRelPath(t *testing.T) {
 		}
 		if ok && got != tt.want {
 			t.Errorf("cleanRelPath(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+// TestCleanRelPathRejectsWindowsRootedPaths is the regression for a rooted
+// path slipping past cleanRelPath on Windows: filepath.IsAbs is
+// volume-relative there, so "/etc/passwd" (no drive letter) reports false
+// even though the leading slash still roots it at the current drive, and a
+// bare "C:foo" volume-name form isn't caught by IsAbs either. Both
+// filepath.IsAbs and filepath.VolumeName are no-ops on every other OS (a
+// leading "/" is already absolute there, and VolumeName always returns ""),
+// so this only exercises anything on Windows and is skipped elsewhere.
+func TestCleanRelPathRejectsWindowsRootedPaths(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("filepath.IsAbs/VolumeName only differ from every other OS on windows")
+	}
+	for _, in := range []string{"/etc/passwd", `C:\Windows\System32\config`, "C:foo"} {
+		if _, ok := cleanRelPath(in); ok {
+			t.Errorf("cleanRelPath(%q) ok = true, want false (rooted path)", in)
 		}
 	}
 }
@@ -269,24 +290,24 @@ func TestAddWizardForwardAndBackNavigation(t *testing.T) {
 		t.Fatalf("step = %v, want stepIdentify", m.step)
 	}
 
-	// identify -> associate, when matches are found.
+	// identify -> associate, when matches are found. gen must match what
+	// entering stepIdentify bumped it to, exactly like the fetch step above.
 	matches := []identity.Match{{ProjectID: "existing1", Strength: identity.StrengthStrong}}
-	if done, _ := m.Update(identifyMsg{matches: matches}); done {
+	if done, _ := m.Update(identifyMsg{gen: m.identGen, matches: matches}); done {
 		t.Fatalf("identify completing should not leave the wizard")
 	}
 	if m.step != stepAssociate {
 		t.Fatalf("step = %v, want stepAssociate (matches were found)", m.step)
 	}
 
-	// esc walks all the way back to stepPath, then leaves the wizard.
-	wantSteps := []addStep{stepIdentify, stepFetch, stepPath}
-	for _, want := range wantSteps {
-		if done, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc}); done {
-			t.Fatalf("esc left the wizard early, expected to land on %v", want)
-		}
-		if m.step != want {
-			t.Fatalf("step after esc = %v, want %v", m.step, want)
-		}
+	// esc skips the non-interactive stepFetch/stepIdentify (goBack never
+	// lands on either — see goBack's doc comment) and goes straight back to
+	// stepPath in one press; a second esc then leaves the wizard.
+	if done, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc}); done {
+		t.Fatalf("esc from stepAssociate left the wizard early, expected to land on stepPath")
+	}
+	if m.step != stepPath {
+		t.Fatalf("step after esc = %v, want stepPath", m.step)
 	}
 	done, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
 	if !done {
@@ -436,10 +457,29 @@ func writeTrackedFiles(t *testing.T, s *app.Session, projectID string, files map
 // stepSelect discarding the candidate list: the scan step is not itself
 // interactive, so backing out of stepSelect must skip it (not re-scan) and
 // land on whichever step started the scan, without touching m.cand.
+//
+// The scan here is started from stepAssociate (a strong match found, then
+// the user picks "create new anyway") rather than stepIdentify's no-match
+// path: stepIdentify is itself always skipped while unwinding (see goBack's
+// doc comment — re-entering it would just re-run identify and, on finding
+// the same match again, bounce straight back to stepAssociate), so a
+// meaningful test of "land on whichever step started the scan" needs that
+// step to be one goBack actually stops on. stepAssociate is genuinely
+// interactive and is not skipped.
 func TestGoBackSkipsScanKeepingSelectionState(t *testing.T) {
+	matches := []identity.Match{{ProjectID: "existing1", Strength: identity.StrengthStrong}}
 	m := &addModel{ctx: context.Background(), s: &app.Session{}, dir: "/tmp/example", step: stepIdentify}
-	if done, _ := m.Update(identifyMsg{}); done {
-		t.Fatalf("identify with no matches should not leave the wizard")
+	if done, _ := m.Update(identifyMsg{matches: matches}); done {
+		t.Fatalf("identify with a match should not leave the wizard")
+	}
+	if m.step != stepAssociate {
+		t.Fatalf("setup: step = %v, want stepAssociate", m.step)
+	}
+
+	// Choose "create new project anyway" (the row past the last match).
+	m.assocIdx = len(m.matches)
+	if done, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter}); done {
+		t.Fatalf("choosing create-new should not leave the wizard")
 	}
 	if m.step != stepScan {
 		t.Fatalf("setup: step = %v, want stepScan", m.step)
@@ -461,8 +501,8 @@ func TestGoBackSkipsScanKeepingSelectionState(t *testing.T) {
 	if done, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc}); done {
 		t.Fatalf("esc from stepSelect should not leave the wizard")
 	}
-	if m.step != stepIdentify {
-		t.Fatalf("esc from stepSelect should skip the non-interactive scan step and land on stepIdentify, got %v", m.step)
+	if m.step != stepAssociate {
+		t.Fatalf("esc from stepSelect should skip the non-interactive scan step and land on stepAssociate, got %v", m.step)
 	}
 	if m.cand != cand {
 		t.Fatalf("esc from stepSelect must not discard the candidate list built by the scan")

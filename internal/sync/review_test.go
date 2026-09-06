@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -378,6 +379,9 @@ func TestRestoreReconcilesMode(t *testing.T) {
 // journal entry or base was recorded for it.
 func TestConflictWritesBlobBeforeLocalFile(t *testing.T) {
 	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("directory permissions are not enforced on Windows")
+	}
 	if os.Geteuid() == 0 {
 		t.Skip("root ignores directory permissions")
 	}
