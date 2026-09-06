@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -238,6 +239,46 @@ func TestDashboardLinkPromptRejectsMissingPath(t *testing.T) {
 	}
 	if m.linking.err == "" {
 		t.Fatalf("expected an error asking for a local path")
+	}
+}
+
+// TestDashboardLinkDoneStartsPullSyncView is the regression for the link
+// flow's success path never having a test: linkDoneMsg (LinkProject
+// finishing) must start a ModePull syncView scoped to just that project, not
+// merely clear the link prompt.
+func TestDashboardLinkDoneStartsPullSyncView(t *testing.T) {
+	m := newTestDashboard(t)
+	action, cmd := m.Update(linkDoneMsg{projectID: "p2"})
+	if action.kind != dashActionNone {
+		t.Fatalf("linkDoneMsg action = %+v, want dashActionNone (stays on the dashboard)", action)
+	}
+	if !m.svActive || m.sv == nil {
+		t.Fatalf("linkDoneMsg should start a syncView")
+	}
+	if m.sv.opts.Mode != sync.ModePull {
+		t.Fatalf("sv.opts.Mode = %v, want ModePull", m.sv.opts.Mode)
+	}
+	if len(m.sv.opts.Projects) != 1 || m.sv.opts.Projects[0] != "p2" {
+		t.Fatalf("sv.opts.Projects = %v, want [p2]", m.sv.opts.Projects)
+	}
+	if cmd == nil {
+		t.Fatalf("expected the syncView's Init() command")
+	}
+}
+
+// TestDashboardLinkDoneErrorStaysOnDashboard covers the sibling failure path:
+// a LinkProject error must be reported, not silently start a pull.
+func TestDashboardLinkDoneErrorStaysOnDashboard(t *testing.T) {
+	m := newTestDashboard(t)
+	action, _ := m.Update(linkDoneMsg{projectID: "p2", err: errors.New("boom")})
+	if action.kind != dashActionNone {
+		t.Fatalf("linkDoneMsg action = %+v, want dashActionNone", action)
+	}
+	if m.svActive {
+		t.Fatalf("a failed link should not start a syncView")
+	}
+	if m.err == "" {
+		t.Fatalf("expected err to be set")
 	}
 }
 

@@ -210,3 +210,26 @@ func TestSyncViewResolverAbortCancelsContext(t *testing.T) {
 		t.Fatalf("aborting the resolver should cancel the syncView's context")
 	}
 }
+
+// TestSyncViewResolverResolveGoesToApply is the counterpart to
+// TestSyncViewResolverAbortCancelsContext: only the abort path used to be
+// exercised, leaving the ordinary "answer the last conflict" hand-off from
+// stageResolve to stageApply untested.
+func TestSyncViewResolverResolveGoesToApply(t *testing.T) {
+	it := textConflictItem()
+	m := newTestSyncView()
+	m.stage = stageResolve
+	m.plan = planWith(it)
+	m.resolver = NewResolver(m.plan, m.res)
+
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("l")})
+	if next.stage != stageApply {
+		t.Fatalf("stage = %v, want stageApply", next.stage)
+	}
+	if cmd == nil {
+		t.Fatalf("expected the apply stage's command once the resolver hands off")
+	}
+	if _, ok := next.res[it.Key]; !ok {
+		t.Fatalf("resolving the item should have recorded a resolution before handing off")
+	}
+}

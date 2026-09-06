@@ -231,6 +231,26 @@ func TestResolverMergedWhenClean(t *testing.T) {
 	}
 }
 
+// TestDiffContentCleanMergeShowsDiffAndPreview is the regression for spec
+// §2.2 item 5 ("plus the auto-merge if clean"): a clean auto-merge used to
+// show only the merged preview, hiding the local-vs-remote diff that every
+// other conflict kind gets.
+func TestDiffContentCleanMergeShowsDiffAndPreview(t *testing.T) {
+	it := textConflictItem()
+	it.Merge = &merge.Result{Kind: merge.KindText, Clean: true, Merged: []byte("merged content\n")}
+
+	content := diffContent(&it)
+	if !strings.Contains(content, "LOCAL-CHANGE") || !strings.Contains(content, "REMOTE-CHANGE") {
+		t.Fatalf("diffContent for a clean merge should still show the local-vs-remote diff, got %q", content)
+	}
+	if !strings.Contains(content, "merged content") {
+		t.Fatalf("diffContent for a clean merge should also show the merged preview, got %q", content)
+	}
+	if !strings.Contains(content, "press m to use it") {
+		t.Fatalf("diffContent should keep the existing merged-preview call to action, got %q", content)
+	}
+}
+
 func TestResolverBulkLocalAndRemote(t *testing.T) {
 	a := textConflictItem()
 	a.Key.Path = "a.txt"
@@ -357,6 +377,32 @@ func TestResolverDotenvRefusesUntilAllChosen(t *testing.T) {
 	}
 	if m.msg == "" {
 		t.Fatalf("expected a message explaining the refusal")
+	}
+}
+
+// TestResolverKeyGuardsAgainstEmptyDotenvHunks is the regression for a
+// dotenv-shaped merge.Result with Clean=false but zero Hunks (e.g. every
+// conflicting section fell outside what the dotenv merger tracks as a key):
+// without a length guard, "k" would open the per-key sub-mode with an empty
+// hunks slice, and updateDotenv's "l"/"r" handlers index
+// ds.hunks[ds.cursor] with no bounds check, which panics on the very first
+// keypress.
+func TestResolverKeyGuardsAgainstEmptyDotenvHunks(t *testing.T) {
+	it := textConflictItem()
+	it.Merge = &merge.Result{Kind: merge.KindDotenv, Clean: false} // Hunks is nil
+
+	m := NewResolver(planWith(it), sync.Resolutions{})
+	next, _ := m.Update(key("k"))
+	m = next.(*Resolver)
+
+	if m.dotenv != nil {
+		t.Fatalf("k should not open the per-key sub-mode when there are no hunks to choose between")
+	}
+	if m.msg == "" {
+		t.Fatalf("expected a message explaining why per-key resolution was refused")
+	}
+	if !strings.Contains(m.msg, "per-key resolution") {
+		t.Fatalf("msg = %q, want the usual per-key-unavailable message", m.msg)
 	}
 }
 
