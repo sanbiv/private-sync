@@ -86,14 +86,60 @@ func (c *cli) runSetup(ctx context.Context, existing *config.Config) (*app.Sessi
 	for _, w := range a.Config.Warnings() {
 		c.warn(w)
 	}
-	log := func(line string) { fmt.Fprintln(c.out, line) }
-	s, err := a.Setup(ctx, c.prompter, log)
+	s, err := a.Setup(ctx, c.prompter, c.setupLogger())
 	if err != nil {
 		return nil, err
 	}
 	s.Warn = c.warn
 	fmt.Fprintf(c.out, "vault %s ready at %s\n", s.Vault.ID(), display(s.Vault.Dir()))
 	return s, nil
+}
+
+// setupFromConfig creates or opens the vault described by an existing
+// configuration, skipping the wizard (spec §10.1 still applies: prepare,
+// fetch, then open or create-push-verify).
+func (c *cli) setupFromConfig(ctx context.Context, a *app.App) (*app.Session, error) {
+	for _, w := range a.Config.Warnings() {
+		c.warn(w)
+	}
+	s, err := a.Setup(ctx, c.prompter, c.setupLogger())
+	if err != nil {
+		c.dumpRemoteLog()
+		return nil, err
+	}
+	s.Warn = c.warn
+	fmt.Fprintf(c.out, "vault %s ready at %s\n", s.Vault.ID(), display(s.Vault.Dir()))
+	return s, nil
+}
+
+// setupLogger reports setup progress on stdout but sends the remote's own
+// chatter (command echoes, transport output) through the --verbose gate, so
+// a plain `init` prints what happened, not how.
+func (c *cli) setupLogger() func(string) {
+	remote := c.remoteLogger("setup")
+	return func(line string) {
+		if isRemoteChatter(line) {
+			remote(line)
+			return
+		}
+		fmt.Fprintln(c.out, line)
+	}
+}
+
+// isRemoteChatter reports whether a setup log line is the transport talking
+// (the command being run, or the tool's own stdout/stderr) rather than a step
+// of the setup itself.
+func isRemoteChatter(line string) bool {
+	t := strings.TrimSpace(line)
+	if strings.HasPrefix(t, "$ ") {
+		return true
+	}
+	for _, p := range []string{"git:", "rclone:", "bw:"} {
+		if strings.HasPrefix(t, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // initCommand: the setup wizard without the dashboard.
@@ -111,6 +157,18 @@ func (c *cli) initCommand() *cobra.Command {
 			case errors.Is(err, app.ErrNoConfig):
 			default:
 				return err
+			}
+			// A complete configuration already answers everything the
+			// wizard asks, so --yes goes straight to the vault: that is
+			// what scripts and a second machine provisioned by hand need,
+			// and the wizard would only fail without a terminal.
+			if existing != nil && c.g.yes {
+				s, err := c.setupFromConfig(cmd.Context(), a)
+				if err != nil {
+					return err
+				}
+				s.Close()
+				return nil
 			}
 			s, err := c.runSetup(cmd.Context(), existing)
 			if err != nil {
