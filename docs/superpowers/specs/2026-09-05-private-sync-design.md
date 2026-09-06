@@ -776,3 +776,32 @@ detection, pending blob. `internal/remote` tests git against a local bare reposi
 * Children never inherit `PRIVATE_SYNC_PASSPHRASE`/`BW_*`; git never prompts.
 * `--yes` never deletes anything on its own; `--delete` is the only way to propagate a
   local deletion non-interactively.
+
+## 14. Decisions taken during implementation
+
+These resolve ambiguities or contradictions found while building v2. They are
+part of the contract; the tests pin them.
+
+* **Pre-selection precedence** (§6). A file tracked in the vault is always
+  pre-selected, even when git also tracks it: "vault-tracked ⇒ checked" wins
+  over "git-tracked ⇒ never pre-selected", so re-scanning a project never
+  silently drops a file already under sync. Untracked secret-ish files stay
+  pre-selected; plain git-tracked files never are.
+* **`exclude_dirs` matching** (§6) is case-insensitive, matching the default
+  macOS filesystem. `.git` is always skipped even when a custom
+  `scan.exclude_dirs` replaces the defaults.
+* **rclone paths** (§10). `rclone.path` keeps a leading `/`: an absolute path
+  stays absolute, since backends resolve a relative path against the remote's
+  own root.
+* **Terminal background** (§2.2). Lip Gloss resolves `AdaptiveColor` on first
+  render, which inside a running Bubble Tea program races the program's own
+  stdin reader. The background is therefore resolved once before any program
+  starts; `PRIVATE_SYNC_BACKGROUND=dark|light` skips the query for terminals
+  that never answer it, and non-terminal stdio defaults to dark.
+* **Deletion prompts** (§9, §13). `--yes` alone never writes a tombstone.
+  Propagating a local deletion needs `--delete` or an explicit
+  `files delete`, and the local pre-image reaches the encrypted trash before
+  any local file is removed.
+* **Passphrase source after `passphrase change`**. The command rewrites the
+  key file when `key.source: file`, and warns when the passphrase came from
+  the environment or Bitwarden, where the new value must be stored by hand.
