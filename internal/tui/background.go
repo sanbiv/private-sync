@@ -14,15 +14,19 @@ const BackgroundEnv = "PRIVATE_SYNC_BACKGROUND"
 
 var backgroundOnce sync.Once
 
-// initBackground resolves the terminal background colour once, before any
-// tea.Program is started.
+// initBackground pins the palette Lip Gloss uses for AdaptiveColor.
 //
-// Lip Gloss resolves AdaptiveColor lazily, on the first render. Inside a
-// running Bubble Tea program that render happens while the program owns
-// stdin, so the terminal's answer to the background query races the program's
-// own input reader; a terminal that stays silent costs a five second stall
-// before termenv falls back. Resolving it here, while stdin is still ours,
-// keeps the first frame immediate.
+// It does not avoid the terminal query: Bubble Tea's own package init already
+// calls lipgloss.HasDarkBackground() (bubbletea/tea_init.go), so the OSC 11
+// query is issued before main runs, and its answer is cached on the default
+// renderer. What this adds is an override for terminals whose answer is wrong
+// or absent, and a definite value when stdio is not a terminal at all.
+//
+// A terminal that claims a normal TERM and then ignores the query costs
+// termenv its full five second timeout, once, at process start — every
+// command pays it, including ones that open no UI. termenv skips the query
+// for TERM=dumb and for TERM starting with screen or tmux, so those are the
+// only levers, and PRIVATE_SYNC_BACKGROUND is not one of them.
 func initBackground() {
 	backgroundOnce.Do(func() {
 		dark, decided := backgroundChoice(os.Getenv(BackgroundEnv), os.Getenv("TERM"), interactiveStdio())
