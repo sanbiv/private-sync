@@ -575,10 +575,7 @@ func DefaultExcludeDirs() []string {
 		".next", ".nuxt", ".svelte-kit", ".venv", "venv", "env", "__pycache__", ".idea", ".cache",
 		"coverage", ".terraform", "bin", "obj", "Pods", "DerivedData", ".gradle", ".dart_tool",
 		".turbo", ".parcel-cache", ".pytest_cache", ".mypy_cache", "tmp", "logs", "testdata",
-		"fixtures", "__fixtures__", "locales", "i18n", ".github", ".lh", ".astro",
-		".vercel", ".netlify", ".firebase", ".vscode", ".vscode-test", ".vscode-remote",
-		"db_data",
-		".agents", ".claude", ".impeccable", ".replit", ".stackblitz", ".codesandbox", ".glitch", ".heroku", ".fly",
+		"fixtures", "__fixtures__", "locales", "i18n", ".github",
 	}
 }
 
