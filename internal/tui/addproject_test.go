@@ -598,6 +598,177 @@ func TestUpdateFetchIgnoresStaleGeneration(t *testing.T) {
 	}
 }
 
+// TestUpdateIdentifyIgnoresStaleGeneration is the regression for esc back to
+// stepPath, a different directory, and a fresh identify starting before the
+// OLD identify's result arrives: without gen, that stale identifyMsg would
+// be applied and the wizard would associate with the wrong vault project.
+func TestUpdateIdentifyIgnoresStaleGeneration(t *testing.T) {
+	m := &addModel{ctx: context.Background(), s: &app.Session{}, step: stepIdentify, identGen: 2}
+
+	stale := identifyMsg{gen: 1, err: errors.New("stale failure from a cancelled/superseded run")}
+	if done, _ := m.Update(stale); done {
+		t.Fatalf("a stale identifyMsg should not leave the wizard")
+	}
+	if m.err != "" {
+		t.Fatalf("a stale identifyMsg must not set err, got %q", m.err)
+	}
+	if m.step != stepIdentify {
+		t.Fatalf("a stale identifyMsg must not change the step, got %v", m.step)
+	}
+
+	matches := []identity.Match{{ProjectID: "existing1", Strength: identity.StrengthStrong}}
+	current := identifyMsg{gen: 2, matches: matches}
+	if done, _ := m.Update(current); done {
+		t.Fatalf("a current identifyMsg should not leave the wizard")
+	}
+	if m.step != stepAssociate {
+		t.Fatalf("a current identifyMsg should advance to stepAssociate, got %v", m.step)
+	}
+}
+
+// TestUpdateIdentifyEscCancelsContext is the regression for esc not actually
+// stopping the identify's git subprocesses (spec §2.2 "esc cancels the
+// running operation"): without calling identCancel, a superseded identify
+// for the old directory keeps running to completion in the background.
+func TestUpdateIdentifyEscCancelsContext(t *testing.T) {
+	m := &addModel{ctx: context.Background(), s: &app.Session{}, step: stepIdentify}
+	ctx, cancel := context.WithCancel(m.ctx)
+	m.identCtx, m.identCancel = ctx, cancel
+
+	m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+
+	if ctx.Err() != context.Canceled {
+		t.Fatalf("esc on stepIdentify should cancel identCtx, err = %v", ctx.Err())
+	}
+}
+
+// TestEnterStepIdentifyBumpsGenerationAndContext checks the enterCmd side of
+// the same guard: every (re-)entry into stepIdentify must hand out a fresh
+// generation and a fresh cancellable context, exactly like stepFetch/stepScan.
+func TestEnterStepIdentifyBumpsGenerationAndContext(t *testing.T) {
+	m := &addModel{ctx: context.Background(), s: &app.Session{}, dir: "/tmp/example"}
+	cmd := m.goTo(stepIdentify)
+	if cmd == nil {
+		t.Fatalf("goTo(stepIdentify) should return the identifyCmd")
+	}
+	if m.identGen != 1 {
+		t.Fatalf("identGen = %d, want 1", m.identGen)
+	}
+	if m.identCtx == nil || m.identCancel == nil {
+		t.Fatalf("entering stepIdentify should set up a cancellable child context")
+	}
+	if err := m.identCtx.Err(); err != nil {
+		t.Fatalf("a freshly entered identCtx should not be cancelled yet, err = %v", err)
+	}
+
+	// Entering again (as a second identify would) must bump the generation
+	// again and cancel the previous context.
+	prevCtx := m.identCtx
+	m.goTo(stepIdentify)
+	if m.identGen != 2 {
+		t.Fatalf("identGen after a second entry = %d, want 2", m.identGen)
+	}
+	if prevCtx.Err() != nil {
+		t.Fatalf("re-entering stepIdentify should not retroactively cancel the previous context; only esc does")
+	}
+}
+
+// --- fetch/scan child-context cleanup and retry -----------------------------
+
+// TestUpdateFetchCancelsContextOnCompletion is the regression for the
+// fetch's child context leaking once the operation finishes on its own
+// (success or failure): only esc used to call fetchCancel, so a fetch that
+// completes normally never released its parent-context registration for the
+// rest of the program's life.
+func TestUpdateFetchCancelsContextOnCompletion(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		msg  opDoneMsg
+	}{
+		{"success", opDoneMsg{Tag: "fetch", Gen: 1}},
+		{"failure", opDoneMsg{Tag: "fetch", Gen: 1, Err: errors.New("boom")}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &addModel{ctx: context.Background(), s: &app.Session{}, step: stepFetch, fetchGen: 1}
+			ctx, cancel := context.WithCancel(m.ctx)
+			m.fetchCtx, m.fetchCancel = ctx, cancel
+
+			m.Update(tc.msg)
+
+			if ctx.Err() != context.Canceled {
+				t.Fatalf("a finished fetch must cancel its child context, err = %v", ctx.Err())
+			}
+		})
+	}
+}
+
+// TestUpdateScanCancelsContextOnCompletion is scanCancel's counterpart to
+// TestUpdateFetchCancelsContextOnCompletion.
+func TestUpdateScanCancelsContextOnCompletion(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		msg  scanDoneMsg
+	}{
+		{"success", scanDoneMsg{Gen: 1, Result: &scan.Result{}}},
+		{"failure", scanDoneMsg{Gen: 1, Err: errors.New("boom")}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &addModel{ctx: context.Background(), s: &app.Session{}, step: stepScan, scanGen: 1}
+			ctx, cancel := context.WithCancel(m.ctx)
+			m.scanCtx, m.scanCancel = ctx, cancel
+
+			m.Update(tc.msg)
+
+			if ctx.Err() != context.Canceled {
+				t.Fatalf("a finished scan must cancel its child context, err = %v", ctx.Err())
+			}
+		})
+	}
+}
+
+// TestUpdateFetchErrorAllowsRetry is the regression for a failed fetch
+// leaving the wizard stuck at stepFetch with the spinner still animating
+// under "fetching remote..." and no way to retry short of quitting.
+func TestUpdateFetchErrorAllowsRetry(t *testing.T) {
+	m := &addModel{ctx: context.Background(), s: &app.Session{}, step: stepFetch, fetchGen: 1, fetchSpin: newSpinner()}
+	ctx, cancel := context.WithCancel(m.ctx)
+	m.fetchCtx, m.fetchCancel = ctx, cancel
+
+	if done, _ := m.Update(opDoneMsg{Tag: "fetch", Gen: 1, Err: errors.New("network unreachable")}); done {
+		t.Fatalf("a failed fetch should not leave the wizard")
+	}
+	if m.fetchErr == nil {
+		t.Fatalf("a failed fetch should set fetchErr")
+	}
+	if m.step != stepFetch {
+		t.Fatalf("a failed fetch should stay at stepFetch so the user can retry, got %v", m.step)
+	}
+	if !strings.Contains(m.View(), "fetch failed") || !strings.Contains(m.View(), "retry") {
+		t.Fatalf("View() = %q, want it to mention the failure and offer a retry", m.View())
+	}
+
+	// The spinner must stop animating once the fetch has failed, or the
+	// screen still reads as if it were working.
+	if _, cmd := m.Update(spinner.TickMsg{}); cmd != nil {
+		t.Fatalf("a spinner tick after fetchErr is set should not keep animating it")
+	}
+
+	// "enter" retries: a fresh generation and a cleared error.
+	done, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if done {
+		t.Fatalf("retrying a failed fetch should not leave the wizard")
+	}
+	if cmd == nil {
+		t.Fatalf("retrying should return the new fetch's command")
+	}
+	if m.fetchErr != nil {
+		t.Fatalf("retrying should clear fetchErr, got %v", m.fetchErr)
+	}
+	if m.fetchGen != 2 {
+		t.Fatalf("retrying should bump fetchGen, got %d", m.fetchGen)
+	}
+}
+
 // --- RunAddProject's aborted-vs-finished reporting --------------------------
 
 func TestFinishErr(t *testing.T) {
