@@ -134,3 +134,12 @@ esterno). Le cancellazioni locali non vengono mai propagate senza `--delete` o
 `files delete`; i file sostituiti finiscono nel cestino cifrato.
 
 La specifica completa è in `docs/superpowers/specs/2026-09-05-private-sync-design.md`.
+
+## Variabili d'ambiente utili
+
+| variabile | effetto |
+|---|---|
+| `PRIVATE_SYNC_PASSPHRASE` | passphrase per esecuzioni non interattive (rimossa dall'ambiente dei processi figli) |
+| `PRIVATE_SYNC_CONFIG` | percorso alternativo del file di configurazione |
+| `PRIVATE_SYNC_BACKGROUND` | `dark` o `light`: fissa la palette della TUI sui terminali che non rispondono alla richiesta del colore di sfondo |
+| `BW_SESSION` | sessione Bitwarden già sbloccata, riutilizzata dalla sorgente `bitwarden` |

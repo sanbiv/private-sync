@@ -17,6 +17,7 @@ import (
 // written to disk here — the caller (cli/app.Setup) saves the returned
 // config and runs the vault creation protocol.
 func RunSetup(ctx context.Context, dirs paths.Dirs, existing *config.Config) (*config.Config, error) {
+	initBackground()
 	if ctx == nil {
 		ctx = context.Background()
 	}

@@ -47,6 +47,7 @@ type rootModel struct {
 
 // Run launches the dashboard program on an opened session (spec §2.2 item 2).
 func Run(ctx context.Context, s *app.Session) error {
+	initBackground()
 	if ctx == nil {
 		ctx = context.Background()
 	}

@@ -1142,6 +1142,7 @@ func finishErr(finished bool) error {
 // RunAddProject runs the add-project wizard as its own program (spec §2.2
 // item 3; used by the `add` CLI command).
 func RunAddProject(ctx context.Context, s *app.Session, dir string) error {
+	initBackground()
 	if ctx == nil {
 		ctx = context.Background()
 	}

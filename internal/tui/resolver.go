@@ -603,6 +603,7 @@ func helpLineFor(it *sync.Item, inDotenv bool) string {
 // the front end's entry points; the resolver only needs the plan's own
 // decrypted contents and paths.
 func ResolveConflicts(ctx context.Context, s *app.Session, p *sync.Plan) (res sync.Resolutions, aborted bool, err error) {
+	initBackground()
 	if ctx == nil {
 		ctx = context.Background()
 	}
