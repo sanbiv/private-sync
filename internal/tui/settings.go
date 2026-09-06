@@ -203,6 +203,15 @@ func (m *settingsModel) updateForm(msg tea.Msg) (bool, tea.Cmd) {
 			return false, tea.Batch(cmd, m.form.Init())
 		}
 		if m.wantRekey {
+			// A captured PRIVATE_SYNC_PASSPHRASE outranks every configured
+			// key source, so rewrapping the vault key now would leave that
+			// stale value in use and lock this environment out (the CLI's
+			// `passphrase change` refuses for the same reason).
+			if keysource.EnvCaptured() {
+				m.rekeyErr = envRekeyRefusal
+				m.step = settingsStepDone
+				return false, cmd
+			}
 			m.rekeyErr = ""
 			m.rekey = newRekeyPrompt()
 			m.step = settingsStepRekeyForm
@@ -250,6 +259,10 @@ func (m *settingsModel) save() error {
 	*m.s.Config = cfg
 	return m.s.SaveConfig()
 }
+
+// envRekeyRefusal explains why the passphrase cannot be changed while one was
+// captured from the environment at startup.
+const envRekeyRefusal = "PRIVATE_SYNC_PASSPHRASE is set and overrides the configured key source: unset it and try again, otherwise that stale passphrase would lock this environment out of the vault"
 
 func (m *settingsModel) updateRekeyForm(msg tea.Msg) (bool, tea.Cmd) {
 	if m.rekey == nil {

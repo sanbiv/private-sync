@@ -80,7 +80,7 @@ func (p *TerminalPrompter) Confirm(ctx context.Context, title string, def bool) 
 	}
 	t, err := p.open()
 	if err != nil {
-		return false, err
+		return false, confirmErr(err)
 	}
 	defer t.release()
 	hint := "[y/N]"
@@ -227,6 +227,19 @@ func (p *TerminalPrompter) open() (*ttyHandle, error) {
 		return nil, fmt.Errorf("%w (%s is not a terminal)", ui.ErrNonInteractive, path)
 	}
 	return newTTYHandle(fd, f, f, func() { _ = f.Close() }), nil
+}
+
+// confirmErr restates a non-interactive prompt failure in confirmation terms.
+// open() speaks for key acquisition ("set PRIVATE_SYNC_PASSPHRASE"), which is
+// the wrong remedy for a missing yes/no answer: that one is fixed with --yes.
+func confirmErr(err error) error {
+	if err == nil || !errors.Is(err, ui.ErrNonInteractive) {
+		return err
+	}
+	if detail := strings.TrimSpace(strings.TrimPrefix(err.Error(), ui.ErrNonInteractive.Error())); detail != "" {
+		return fmt.Errorf("%w %s", ui.ErrNonInteractiveConfirm, detail)
+	}
+	return ui.ErrNonInteractiveConfirm
 }
 
 // ctxErr returns the context error, tolerating a nil context.

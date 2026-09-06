@@ -532,7 +532,9 @@ func (c *cli) openSession(ctx context.Context) (*app.Session, error) {
 		}
 		return nil, err
 	}
-	s, err := a.Open(ctx, c.prompter)
+	// --no-remote must not touch the network: OpenWith skips the remote's
+	// Prepare (a git fetch / rclone stat) so read-only commands work offline.
+	s, err := a.OpenWith(ctx, c.prompter, app.OpenOptions{NoRemote: c.g.noRemote, Warn: c.warn})
 	if err != nil {
 		return nil, err
 	}

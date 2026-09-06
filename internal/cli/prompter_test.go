@@ -3,9 +3,11 @@ package cli
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/sanbiv/private-sync/internal/ui"
@@ -93,5 +95,50 @@ func TestCtxErr(t *testing.T) {
 	cancel()
 	if err := ctxErr(ctx); !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestConfirmErrUsesConfirmationRemedy(t *testing.T) {
+	t.Run("plain sentinel", func(t *testing.T) {
+		got := confirmErr(ui.ErrNonInteractive)
+		if !errors.Is(got, ui.ErrNonInteractiveConfirm) {
+			t.Fatalf("confirmErr(%v) = %v, want the confirmation sentinel", ui.ErrNonInteractive, got)
+		}
+		if strings.Contains(got.Error(), "PRIVATE_SYNC_PASSPHRASE") {
+			t.Errorf("confirmation error mentions the passphrase: %q", got)
+		}
+		if !strings.Contains(got.Error(), "--yes") {
+			t.Errorf("confirmation error does not name --yes: %q", got)
+		}
+	})
+	t.Run("keeps the detail", func(t *testing.T) {
+		wrapped := fmt.Errorf("%w (/dev/tty is not a terminal)", ui.ErrNonInteractive)
+		got := confirmErr(wrapped)
+		if !errors.Is(got, ui.ErrNonInteractiveConfirm) {
+			t.Fatalf("confirmErr(%v) = %v, want the confirmation sentinel", wrapped, got)
+		}
+		if !strings.Contains(got.Error(), "/dev/tty is not a terminal") {
+			t.Errorf("detail lost: %q", got)
+		}
+	})
+	t.Run("other errors pass through", func(t *testing.T) {
+		other := errors.New("boom")
+		if got := confirmErr(other); got != other {
+			t.Errorf("confirmErr(%v) = %v, want it unchanged", other, got)
+		}
+		if confirmErr(nil) != nil {
+			t.Error("confirmErr(nil) != nil")
+		}
+	})
+}
+
+func TestTerminalPrompterConfirmNonInteractive(t *testing.T) {
+	p := &TerminalPrompter{openTTY: func() (*ttyHandle, error) { return nil, ui.ErrNonInteractive }}
+	_, err := p.Confirm(context.Background(), "delete everything?", false)
+	if !errors.Is(err, ui.ErrNonInteractiveConfirm) {
+		t.Fatalf("Confirm error = %v, want the confirmation sentinel", err)
+	}
+	if !errors.Is(err, ui.ErrNonInteractive) {
+		t.Errorf("Confirm error no longer matches the general sentinel: %v", err)
 	}
 }

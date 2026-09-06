@@ -67,6 +67,12 @@ func CaptureEnv() {
 	}
 }
 
+// EnvCaptured reports whether a passphrase was captured from the environment,
+// which Obtain returns in preference to the configured source. Front ends use
+// it to refuse a passphrase change that would leave that captured value stale
+// and lock the environment out of the vault.
+func EnvCaptured() bool { return len(envPassphrase) > 0 }
+
 // FromConfig builds the configured source.
 func FromConfig(cfg config.KeyConfig, r execx.Runner) (Source, error) {
 	switch cfg.Source {
