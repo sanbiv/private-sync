@@ -1,72 +1,72 @@
 # private-sync
 
-CLI + TUI in Go che trova i file di configurazione e i segreti dei tuoi progetti
-(`.env`, `*.yaml`, `*.json`, chiavi, certificati…), li salva **cifrati** in un vault
-locale e sincronizza quel vault fra più computer tramite **git**, **rclone** (Google
-Drive) o una cartella già sincronizzata da un client desktop (Google Drive, Dropbox,
+A Go CLI + TUI that finds your projects' configuration files and secrets
+(`.env`, `*.yaml`, `*.json`, keys, certificates…), stores them **encrypted** in a local
+vault, and syncs that vault across computers using **git**, **rclone** (Google
+Drive), or a folder already synced by a desktop client (Google Drive, Dropbox,
 iCloud, Syncthing).
 
-Ogni computer ha la propria configurazione YAML (percorsi diversi) e il proprio
-identificativo. I progetti vengono riconosciuti sui vari computer tramite *fingerprint*
-(URL del remote git, modulo `go.mod`, nome in `package.json`, …). La sincronizzazione è
-a tre vie (locale ↔ ultima versione sincronizzata ↔ vault) con merge automatico e
-risoluzione interattiva dei conflitti.
+Each computer has its own YAML configuration (with different paths) and its own
+identifier. Projects are recognized across computers using *fingerprints*
+(git remote URL, `go.mod` module, name in `package.json`, …). Sync uses a
+three-way comparison (local ↔ last synced version ↔ vault), with automatic merging
+and interactive conflict resolution.
 
-## Installazione
+## Installation
 
 ```bash
 go install github.com/sanbiv/private-sync/cmd/private-sync@latest
 ```
 
-oppure dal sorgente:
+Or build from source:
 
 ```bash
-make build   # produce bin/private-sync
+make build   # produces bin/private-sync
 ```
 
-Requisiti opzionali: `git` (remote git e riconoscimento file ignorati), `rclone`
+Optional requirements: `git` (git remotes and ignored file detection), `rclone`
 (Google Drive), `bw` (Bitwarden CLI).
 
-## Primo avvio
+## First run
 
 ```bash
 private-sync
 ```
 
-Al primo avvio parte il wizard: percorso del vault, tipo di remote, sorgente della
-chiave (passphrase digitata, file di chiave, Bitwarden) e nome del computer. Alla fine il
-vault viene creato (o aperto, se il remote ne contiene già uno) e si apre la dashboard.
+On first run, a wizard guides you through choosing the vault path, remote type,
+key source (entered passphrase, key file, Bitwarden), and computer name. Once complete,
+the vault is created (or opened if the remote already contains one), and the dashboard opens.
 
-Sul secondo computer basta ripetere `private-sync`, indicare lo stesso remote e la
-stessa passphrase: il vault viene aperto e i progetti già presenti compaiono nella
-dashboard come `not linked`. Con `enter` (o `projects link`) li colleghi alla cartella
-locale e un `pull` ripristina tutti i file.
+On a second computer, simply run `private-sync` again and provide the same remote and
+passphrase: the vault opens, and existing projects appear in the dashboard as
+`not linked`. Use `enter` (or `projects link`) to link them to their local folders,
+then run `pull` to restore all files.
 
-## Uso quotidiano
+## Everyday use
 
-| comando | cosa fa |
+| Command | What it does |
 |---|---|
-| `private-sync` | dashboard interattiva |
-| `private-sync add ~/Work/myapp` | scansiona la cartella, propone i file, associa/crea il progetto nel vault |
-| `private-sync scan ~/Work/myapp` | anteprima dei candidati senza toccare nulla |
-| `private-sync status` | stato per file (nessuna modifica) |
-| `private-sync sync` | sincronizzazione bidirezionale con merge |
-| `private-sync push` / `pull` | solo locale → vault / solo vault → locale |
-| `private-sync restore myapp` | riporta in locale tutti i file del progetto dal vault |
-| `private-sync projects list\|link\|unlink` | gestione dei collegamenti su questo computer |
-| `private-sync files add\|rm\|delete` | aggiunge, smette di seguire, elimina ovunque |
-| `private-sync trash list\|restore\|purge` | cestino cifrato locale |
-| `private-sync passphrase change` | cambia la passphrase (nessun file viene ricifrato) |
-| `private-sync config edit\|show\|path` | configurazione |
+| `private-sync` | Interactive dashboard |
+| `private-sync add ~/Work/myapp` | Scans the folder, suggests files, and links or creates the project in the vault |
+| `private-sync scan ~/Work/myapp` | Previews candidate files without changing anything |
+| `private-sync status` | Shows per-file status (no changes made) |
+| `private-sync sync` | Bidirectional sync with merging |
+| `private-sync push` / `pull` | Local → vault only / vault → local only |
+| `private-sync restore myapp` | Restores all project files locally from the vault |
+| `private-sync projects list\|link\|unlink` | Manages project links on this computer |
+| `private-sync files add\|rm\|delete` | Adds files, stops tracking them, or deletes them everywhere |
+| `private-sync trash list\|restore\|purge` | Manages the local encrypted trash |
+| `private-sync passphrase change` | Changes the passphrase (no files are re-encrypted) |
+| `private-sync config edit\|show\|path` | Configuration |
 
-Flag globali: `--config`, `--yes`, `--strategy ask|local|remote|abort`, `--delete`
-(propaga le cancellazioni locali, mai implicito), `--no-remote`, `--accept-rollback`,
+Global flags: `--config`, `--yes`, `--strategy ask|local|remote|abort`, `--delete`
+(propagates local deletions; never implicit), `--no-remote`, `--accept-rollback`,
 `--json`.
 
-Nella dashboard: `a` aggiungi progetto, `s` sync, `u` push, `d` pull, `r` fetch e
-aggiorna, `enter` dettaglio, `c` impostazioni, `q` esci, `esc` indietro/annulla.
+In the dashboard: `a` add project, `s` sync, `u` push, `d` pull, `r` fetch and
+refresh, `enter` details, `c` settings, `q` quit, `esc` back/cancel.
 
-## Configurazione (`~/.config/private-sync/config.yaml`)
+## Configuration (`~/.config/private-sync/config.yaml`)
 
 ```yaml
 version: 1
@@ -80,7 +80,7 @@ vault:
       url: git@github.com:me/private-sync-vault.git
       branch: main
     rclone:
-      remote: gdrive       # nome del remote rclone
+      remote: gdrive       # rclone remote name
       path: private-sync-vault
 key:
   source: bitwarden        # prompt | file | bitwarden
@@ -88,7 +88,7 @@ key:
     path: ~/.config/private-sync/key
   bitwarden:
     item: private-sync vault
-    field: password        # password | notes | <campo personalizzato>
+    field: password        # password | notes | <custom field>
 scan:
   max_file_size: 2MiB
 projects:
@@ -97,49 +97,49 @@ projects:
     path: ~/Work/myapp
 ```
 
-Variabili d'ambiente: `PRIVATE_SYNC_PASSPHRASE` (per script; viene rimossa dall'ambiente
-dei processi figli), `PRIVATE_SYNC_CONFIG`, `BW_SESSION`.
+Environment variables: `PRIVATE_SYNC_PASSPHRASE` (for scripts; removed from child
+process environments), `PRIVATE_SYNC_CONFIG`, `BW_SESSION`.
 
 ### Google Drive
 
-Due modi:
+Two options:
 
-1. **Cartella sincronizzata** (`remote.type: none`): imposta `vault.path` dentro la
-   cartella di Google Drive per desktop (consigliata la modalità "Mirror files").
-2. **rclone** (`remote.type: rclone`): configura un remote `drive` con `rclone config`
-   e indica `remote` e `path`.
+1. **Synced folder** (`remote.type: none`): set `vault.path` to a location inside the
+   Google Drive for desktop folder ("Mirror files" mode is recommended).
+2. **rclone** (`remote.type: rclone`): configure a `drive` remote with `rclone config`
+   and specify `remote` and `path`.
 
-Il vault è progettato perché ogni computer scriva solo i propri file (più i blob cifrati
-indirizzati per contenuto): nessun conflitto a livello di git o di Drive.
+The vault is designed so that each computer writes only its own files (plus encrypted,
+content-addressed blobs): no conflicts at the git or Drive level.
 
-## Come funziona la sicurezza
+## How security works
 
-* Passphrase → Argon2id → chiave che avvolge una chiave di vault casuale
-  (`vault.json`). Cambiare passphrase riavvolge solo quella chiave.
-* Contenuti cifrati con XChaCha20-Poly1305. I blob sono deterministici (stesso contenuto
-  → stesso file) così due computer non generano mai conflitti.
-* Nel vault e nello stato locale non esiste mai testo in chiaro: anche il cestino è
-  cifrato. Nomi, percorsi e fingerprint dei progetti stanno solo in documenti cifrati.
-* I processi figli (`git`, `rclone`, `bw`, `$EDITOR`) non ereditano mai passphrase o
-  sessioni Bitwarden; `git` non può mai chiedere input interattivo.
+* Passphrase → Argon2id → key that wraps a random vault key
+  (`vault.json`). Changing the passphrase only rewraps that key.
+* Contents are encrypted with XChaCha20-Poly1305. Blobs are deterministic (same content
+  → same file), so two computers never generate conflicts.
+* The vault and local state never contain plaintext: even the trash is
+  encrypted. Project names, paths, and fingerprints are stored only in encrypted documents.
+* Child processes (`git`, `rclone`, `bw`, `$EDITOR`) never inherit passphrases or
+  Bitwarden sessions; `git` can never prompt for interactive input.
 
-## Come funziona la sincronizzazione
+## How sync works
 
-Per ogni file il motore confronta: contenuto locale, ultima versione sincronizzata su
-questo computer (*base*) e versione nel vault (*head*, calcolata con version vector per
-macchina). Modifiche da un solo lato vengono applicate; modifiche da entrambi i lati
-vengono unite (merge per chiave sui file `.env`, diff3 a righe sugli altri file di
-testo); i conflitti residui si risolvono nella TUI (locale, remoto, per chiave, editor
-esterno). Le cancellazioni locali non vengono mai propagate senza `--delete` o
-`files delete`; i file sostituiti finiscono nel cestino cifrato.
+For each file, the engine compares the local content, the last version synced on
+this computer (*base*), and the version in the vault (*head*, calculated using
+per-machine version vectors). Changes on only one side are applied; changes on both
+sides are merged (per-key merging for `.env` files, line-based diff3 for other text
+files). Remaining conflicts are resolved in the TUI (local, remote, per key, or an
+external editor). Local deletions are never propagated without `--delete` or
+`files delete`; replaced files go into the encrypted trash.
 
-La specifica completa è in `docs/superpowers/specs/2026-09-05-private-sync-design.md`.
+The full specification is in `docs/superpowers/specs/2026-09-05-private-sync-design.md`.
 
-## Variabili d'ambiente utili
+## Useful environment variables
 
-| variabile | effetto |
+| Variable | Effect |
 |---|---|
-| `PRIVATE_SYNC_PASSPHRASE` | passphrase per esecuzioni non interattive (rimossa dall'ambiente dei processi figli) |
-| `PRIVATE_SYNC_CONFIG` | percorso alternativo del file di configurazione |
-| `PRIVATE_SYNC_BACKGROUND` | `dark` o `light`: fissa la palette della TUI sui terminali che non rispondono alla richiesta del colore di sfondo |
-| `BW_SESSION` | sessione Bitwarden già sbloccata, riutilizzata dalla sorgente `bitwarden` |
+| `PRIVATE_SYNC_PASSPHRASE` | Passphrase for non-interactive runs (removed from child process environments) |
+| `PRIVATE_SYNC_CONFIG` | Alternative configuration file path |
+| `PRIVATE_SYNC_BACKGROUND` | `dark` or `light`: sets the TUI palette on terminals that do not respond to background color queries |
+| `BW_SESSION` | An already unlocked Bitwarden session, reused by the `bitwarden` source |
