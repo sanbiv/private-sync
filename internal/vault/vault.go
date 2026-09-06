@@ -658,18 +658,18 @@ func completeKDFParams(p crypto.KDFParams) (crypto.KDFParams, error) {
 func Open(dir string, passphrase []byte, writerID string) (*Vault, error) {
 	defer crypto.Zero(passphrase)
 	if err := checkWriterID(writerID); err != nil {
-		return nil, fmt.Errorf("vault.Open: %w", err)
+		return nil, fmt.Errorf("open vault: %w", err)
 	}
 	vf, err := readVaultFile(dir)
 	if err != nil {
-		return nil, fmt.Errorf("vault.Open: %w", err)
+		return nil, fmt.Errorf("open vault: %w", err)
 	}
 	if err := validateVaultFile(vf); err != nil {
-		return nil, fmt.Errorf("vault.Open: %w", err)
+		return nil, fmt.Errorf("open vault: %w", err)
 	}
 	kek, err := crypto.DeriveKEK(passphrase, vf.KDF)
 	if err != nil {
-		return nil, fmt.Errorf("vault.Open: %w: %w", ErrInvalidVault, err)
+		return nil, fmt.Errorf("open vault: %w: %w", ErrInvalidVault, err)
 	}
 	vk, err := crypto.UnwrapKey(kek, vf.WrappedKey, VaultKeyAADPrefix+vf.ID)
 	crypto.Zero(kek)
@@ -677,14 +677,14 @@ func Open(dir string, passphrase []byte, writerID string) (*Vault, error) {
 		if errors.Is(err, crypto.ErrAuth) {
 			// Deliberately not wrapped: a failed unwrap is the passphrase check
 			// (spec §4), and callers must not mistake it for a corrupt file.
-			return nil, fmt.Errorf("vault.Open: %w", ErrWrongPassphrase)
+			return nil, fmt.Errorf("open vault: %w", ErrWrongPassphrase)
 		}
-		return nil, fmt.Errorf("vault.Open: %w: %w", ErrInvalidVault, err)
+		return nil, fmt.Errorf("open vault: %w: %w", ErrInvalidVault, err)
 	}
 	keys, err := crypto.NewKeys(vk)
 	if err != nil {
 		crypto.Zero(vk)
-		return nil, fmt.Errorf("vault.Open: %w", err)
+		return nil, fmt.Errorf("open vault: %w", err)
 	}
 	return &Vault{
 		dir:        dir,
