@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/huh"
 	"github.com/sanbiv/private-sync/internal/config"
 )
 
@@ -83,6 +84,41 @@ func TestSettingsSaveRejectsInvalidConfigWithoutMutatingSession(t *testing.T) {
 	}
 	if !reflect.DeepEqual(before, *s.Config) {
 		t.Fatalf("save() failure must leave s.Config unchanged:\nbefore=%+v\nafter=%+v", before, *s.Config)
+	}
+}
+
+// TestSettingsUpdateFormRebuildsOnSaveError is the regression for huh v1's
+// Form.Update becoming a permanent no-op once State != StateNormal: leaving
+// m.form as the just-completed (dead) form after a failed save() left the
+// settings screen stuck showing the error with no field the user could fix,
+// and only esc (discarding every typed change) to get out.
+func TestSettingsUpdateFormRebuildsOnSaveError(t *testing.T) {
+	s := newTestSession(t)
+	m := newSettingsModel(context.Background(), s)
+	m.remoteType = string(config.RemoteGit)
+	m.gitURL = "" // invalid: git requires a URL, so save() will fail
+	m.machineName = "still-typed"
+
+	oldForm := m.form
+	m.form.State = huh.StateCompleted // simulate the form having just finished
+
+	back, _ := m.updateForm(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(" ")})
+	if back {
+		t.Fatalf("a failed save should not leave the settings screen")
+	}
+	if m.err == "" {
+		t.Fatalf("a failed save should set m.err")
+	}
+	if m.form == oldForm {
+		t.Fatalf("updateForm must rebuild m.form after a failed save, or huh v1's Form.Update becomes a permanent no-op from here on")
+	}
+	if m.form.State != huh.StateNormal {
+		t.Fatalf("the rebuilt form should start at StateNormal (editable), got %v", m.form.State)
+	}
+	// buildForm binds its fields to the model's own m.* pointers, so the
+	// typed value must survive the rebuild.
+	if m.machineName != "still-typed" {
+		t.Fatalf("machineName = %q, want the typed value preserved across the rebuild", m.machineName)
 	}
 }
 
