@@ -67,7 +67,7 @@ type Candidate struct {
 	GitIgnored  bool
 	SecretName  bool
 	Tracked     bool // already tracked in the vault
-	Preselected bool
+	Preselected bool // checked by default in the UI (spec §6; see dampenCrowdedDirs)
 }
 
 // Options configures a scan. Empty lists mean defaults.
@@ -85,7 +85,13 @@ type Options struct {
 	Tracked       map[string]bool
 	MaxFiles      int // walk cap, default 200000
 	MaxCandidates int // default 5000
-	Progress      func(walked, found int)
+	// MaxPreselectPerDir bounds score-based pre-selection per directory
+	// (spec §6): when more than this many candidates in one directory would
+	// be pre-selected on their score alone, none of them is. Vault-tracked
+	// and secret-named candidates are not counted and keep their
+	// pre-selection. 0 means DefaultMaxPreselectPerDir.
+	MaxPreselectPerDir int
+	Progress           func(walked, found int)
 }
 
 // Result of a scan.
@@ -99,10 +105,11 @@ type Result struct {
 
 // Default limits (spec §6).
 const (
-	DefaultMaxFileSize   int64 = 2 * 1024 * 1024
-	DefaultMaxFiles            = 200000
-	DefaultMaxCandidates       = 5000
-	ProgressInterval           = 500
+	DefaultMaxFileSize        int64 = 2 * 1024 * 1024
+	DefaultMaxFiles                 = 200000
+	DefaultMaxCandidates            = 5000
+	DefaultMaxPreselectPerDir       = 10
+	ProgressInterval                = 500
 )
 
 // Reason strings attached to candidates.
@@ -111,6 +118,7 @@ const (
 	ReasonIgnored      = "ignored by git"
 	ReasonSecretName   = "secret-like name"
 	ReasonVaultTracked = "tracked in vault"
+	ReasonCrowdedDir   = "crowded directory"
 )
 
 // Scan walks dir and returns scored candidates sorted by score desc, then path.
@@ -146,6 +154,10 @@ func Scan(ctx context.Context, dir string, opts Options, r execx.Runner) (*Resul
 	maxCand := opts.MaxCandidates
 	if maxCand <= 0 {
 		maxCand = DefaultMaxCandidates
+	}
+	maxPresel := opts.MaxPreselectPerDir
+	if maxPresel <= 0 {
+		maxPresel = DefaultMaxPreselectPerDir
 	}
 	// Directory names are compared case-insensitively, consistently with the
 	// include/exclude globs, so `Build/` is skipped like `build/`.
@@ -299,6 +311,7 @@ func Scan(ctx context.Context, dir string, opts Options, r execx.Runner) (*Resul
 		c := &res.Candidates[i]
 		scoreCandidate(c, gitInfo, tracked[c.Path], ignored[c.Path], vaultTracked[c.Path])
 	}
+	dampenCrowdedDirs(res.Candidates, maxPresel)
 	sort.SliceStable(res.Candidates, func(i, j int) bool {
 		a, b := res.Candidates[i], res.Candidates[j]
 		if a.Score != b.Score {
@@ -337,6 +350,39 @@ func scoreCandidate(c *Candidate, gitInfo, gitTracked, gitIgnored, vaultTracked 
 		c.Reasons = append(c.Reasons, ReasonVaultTracked)
 	}
 	c.Preselected = c.Score == ScoreHigh || c.Tracked || (c.Score == ScoreMedium && c.SecretName)
+}
+
+// dampenCrowdedDirs withdraws score-based pre-selection from every directory
+// holding more than limit candidates that are pre-selected on their score
+// alone (spec §6). A directory with dozens of git-ignored .json or .yaml
+// files is a build cache, a data dump or generated output far more often
+// than a nest of secrets, and checking all of them by default would push
+// the lot into the vault on a single enter. Vault-tracked candidates keep
+// their pre-selection (spec §14: re-scanning never drops a file already
+// under sync) and so do secret-named ones, whose name is a stronger signal
+// than their neighbours' count; neither counts towards the limit. The
+// remaining candidates of a crowded directory are left unchecked and gain
+// ReasonCrowdedDir so the list says why.
+func dampenCrowdedDirs(cands []Candidate, limit int) {
+	perDir := map[string]int{}
+	for _, c := range cands {
+		if crowdable(c) {
+			perDir[path.Dir(c.Path)]++
+		}
+	}
+	for i := range cands {
+		c := &cands[i]
+		if crowdable(*c) && perDir[path.Dir(c.Path)] > limit {
+			c.Preselected = false
+			c.Reasons = append(c.Reasons, ReasonCrowdedDir)
+		}
+	}
+}
+
+// crowdable reports whether c's pre-selection rests on its score alone, so
+// that a crowded directory may withdraw it.
+func crowdable(c Candidate) bool {
+	return c.Preselected && !c.Tracked && !c.SecretName
 }
 
 // normalizeTracked cleans the vault-tracked relpaths into a slash-separated

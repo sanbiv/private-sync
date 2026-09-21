@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -72,11 +73,11 @@ func TestScoreBadge(t *testing.T) {
 func TestRenderCandidateRow(t *testing.T) {
 	c := scan.Candidate{Path: ".env", Size: 2048, Score: scan.ScoreHigh, Reasons: []string{"ignored by git"}}
 
-	checked := renderCandidateRow(c, true, false, 80)
+	checked := renderCandidateRow(c, true, false, 0)
 	if !strings.Contains(checked, "[x]") {
 		t.Errorf("renderCandidateRow(checked) = %q, want it to contain \"[x]\"", checked)
 	}
-	unchecked := renderCandidateRow(c, false, false, 80)
+	unchecked := renderCandidateRow(c, false, false, 0)
 	if !strings.Contains(unchecked, "[ ]") {
 		t.Errorf("renderCandidateRow(unchecked) = %q, want it to contain \"[ ]\"", unchecked)
 	}
@@ -924,5 +925,365 @@ func TestUpdateIdentifyStaleGenerationKeepsItsContext(t *testing.T) {
 
 	if ctx.Err() != nil {
 		t.Fatalf("a stale identify message must not cancel the live identify, err = %v", ctx.Err())
+	}
+}
+
+// --- candidate tree (spec §2.2 item 3: directory nodes that fold) ----------
+
+// newTreeCandidateList builds a list whose rows span the project root and
+// two directories (one nested), so the tree shape — files first, then one
+// node per directory with its contents below — can be asserted directly.
+// The rows are deliberately out of tree order.
+func newTreeCandidateList() *candidateList {
+	return newCandidateList(&scan.Result{Candidates: []scan.Candidate{
+		{Path: "src/app.json", Score: scan.ScoreMedium},
+		{Path: "config/app.yaml", Score: scan.ScoreHigh, Preselected: true},
+		{Path: ".env", Score: scan.ScoreHigh, Preselected: true},
+		{Path: "config/db.yaml", Score: scan.ScoreMedium},
+		{Path: "config/deep/keys.pem", Score: scan.ScoreHigh, Preselected: true},
+	}})
+}
+
+// treeShape renders the tree's lines as "depth:label" tokens (directory
+// nodes carry a trailing slash) for compact assertions.
+func treeShape(cl *candidateList) string {
+	var out []string
+	for _, l := range cl.lines() {
+		label := l.dir + "/"
+		if !l.isDir() {
+			label = cl.rows[l.row].c.Path
+		}
+		out = append(out, fmt.Sprintf("%d:%s", l.depth, label))
+	}
+	return strings.Join(out, " ")
+}
+
+func pressRune(cl *candidateList, r string) {
+	cl.update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(r)}, "")
+}
+
+func TestCandidateTreeGroupsByDirectory(t *testing.T) {
+	cl := newTreeCandidateList()
+	want := "0:.env 0:config/ 1:config/app.yaml 1:config/db.yaml 1:config/deep/ 2:config/deep/keys.pem 0:src/ 1:src/app.json"
+	if got := treeShape(cl); got != want {
+		t.Fatalf("tree = %q\nwant   %q", got, want)
+	}
+	lines := cl.lines()
+	cfg := lines[dirLine(lines, "config")]
+	if cfg.total != 3 || cfg.checked != 2 {
+		t.Errorf("config/ counts = %d/%d, want 2 of 3 checked (the subtree includes config/deep)", cfg.checked, cfg.total)
+	}
+	if cl.cursor != 0 {
+		t.Errorf("cursor = %d, want 0", cl.cursor)
+	}
+}
+
+func TestCandidateTreeCollapseAndExpand(t *testing.T) {
+	cl := newTreeCandidateList()
+
+	// left on a file folds its directory and lands the cursor on the node.
+	cl.cursor = 3 // config/db.yaml
+	cl.update(tea.KeyMsg{Type: tea.KeyLeft}, "")
+	if !cl.collapsed["config"] {
+		t.Fatalf("left on a file should fold its directory")
+	}
+	if got, want := treeShape(cl), "0:.env 0:config/ 0:src/ 1:src/app.json"; got != want {
+		t.Fatalf("tree after fold = %q, want %q", got, want)
+	}
+	if cl.cursor != 1 {
+		t.Fatalf("cursor = %d, want 1 (the folded config/ node)", cl.cursor)
+	}
+	// left on a folded top-level node has no parent to fold: nothing changes.
+	cl.update(tea.KeyMsg{Type: tea.KeyLeft}, "")
+	if cl.cursor != 1 || !cl.collapsed["config"] {
+		t.Fatalf("left on a folded root-level node should be a no-op")
+	}
+	view := cl.View()
+	if !strings.Contains(view, "▸ config/") || !strings.Contains(view, "2/3 selected") {
+		t.Errorf("folded node should render a fold marker and its counts:\n%s", view)
+	}
+	if strings.Contains(view, "db.yaml") {
+		t.Errorf("a folded node's files must not be rendered:\n%s", view)
+	}
+
+	cl.update(tea.KeyMsg{Type: tea.KeyRight}, "")
+	if cl.collapsed["config"] {
+		t.Fatalf("right on a folded node should unfold it")
+	}
+	if !strings.Contains(cl.View(), "▾ config/") {
+		t.Errorf("unfolded node should render the open marker")
+	}
+
+	// h/l are the vim aliases; on an unfolded node, left folds it in place.
+	pressRune(cl, "h")
+	if !cl.collapsed["config"] || cl.cursor != 1 {
+		t.Fatalf("h on an unfolded node should fold it in place (collapsed=%v cursor=%d)", cl.collapsed["config"], cl.cursor)
+	}
+	pressRune(cl, "l")
+	if cl.collapsed["config"] {
+		t.Fatalf("l should unfold the node again")
+	}
+	// Folding a nested node folds only that level.
+	cl.cursor = 5 // config/deep/keys.pem
+	pressRune(cl, "h")
+	if !cl.collapsed["config/deep"] || cl.collapsed["config"] {
+		t.Fatalf("folding a nested file should fold config/deep only: %v", cl.collapsed)
+	}
+	if got, want := treeShape(cl), "0:.env 0:config/ 1:config/app.yaml 1:config/db.yaml 1:config/deep/ 0:src/ 1:src/app.json"; got != want {
+		t.Fatalf("tree = %q, want %q", got, want)
+	}
+	if cl.cursor != 4 {
+		t.Fatalf("cursor = %d, want 4 (config/deep/ node)", cl.cursor)
+	}
+}
+
+func TestCandidateTreeSpaceOnDirectoryTogglesSubtree(t *testing.T) {
+	cl := newTreeCandidateList()
+	cl.cursor = 1 // config/: 2 of 3 checked
+	space := tea.KeyMsg{Type: tea.KeySpace}
+
+	cl.update(space, "")
+	for _, r := range cl.rows {
+		if strings.HasPrefix(r.c.Path, "config/") && !r.checked {
+			t.Errorf("space on a partly checked node should check its whole subtree; %s is unchecked", r.c.Path)
+		}
+	}
+	cl.update(space, "")
+	for _, r := range cl.rows {
+		if strings.HasPrefix(r.c.Path, "config/") && r.checked {
+			t.Errorf("space on a fully checked node should uncheck its whole subtree; %s is checked", r.c.Path)
+		}
+	}
+	for _, r := range cl.rows {
+		if want := r.c.Path == ".env"; !strings.HasPrefix(r.c.Path, "config/") && r.checked != want {
+			t.Errorf("%s checked = %v, want %v: toggling a node must not touch files outside it", r.c.Path, r.checked, want)
+		}
+	}
+	// A folded node toggles what it hides too.
+	cl.collapsed["config"] = true
+	cl.update(space, "")
+	if n, _ := cl.selectedStats(); n != 4 {
+		t.Errorf("selected = %d after checking the folded config/ node, want 4", n)
+	}
+}
+
+func TestCandidateListSelectAllAndNone(t *testing.T) {
+	cl := newTestCandidateList() // .env, config.yaml, README.md (low: hidden), old-tracked.env
+	checked := func() map[string]bool {
+		out := map[string]bool{}
+		for _, r := range cl.rows {
+			out[r.c.Path] = r.checked
+		}
+		return out
+	}
+
+	pressRune(cl, "a")
+	if got, want := checked(), (map[string]bool{".env": true, "config.yaml": true, "README.md": false, "old-tracked.env": true}); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("after a: %v, want %v (hidden low-score rows stay untouched)", got, want)
+	}
+	pressRune(cl, "n")
+	if got, want := checked(), (map[string]bool{".env": false, "config.yaml": false, "README.md": false, "old-tracked.env": false}); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("after n: %v, want %v", got, want)
+	}
+	if got := cl.untracked(); len(got) != 1 || got[0] != "old-tracked.env" {
+		t.Errorf("untracked() after n = %v, want [old-tracked.env]: deselecting everything drops vault-tracked files too", got)
+	}
+
+	// With a filter active only the matches are affected.
+	cl.filter = "config"
+	pressRune(cl, "a")
+	if got, want := checked(), (map[string]bool{".env": false, "config.yaml": true, "README.md": false, "old-tracked.env": false}); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("after a with filter %q: %v, want %v", cl.filter, got, want)
+	}
+	cl.filter = ""
+	cl.showLow = true
+	pressRune(cl, "a")
+	if !checked()["README.md"] {
+		t.Errorf("after t and a the low-score row is visible and must be selected too")
+	}
+}
+
+func TestCandidateTreeFoldsBigUncheckedDirectoriesAtStart(t *testing.T) {
+	var cands []scan.Candidate
+	for i := 0; i <= treeCollapseThreshold; i++ { // one past the threshold
+		cands = append(cands,
+			scan.Candidate{Path: fmt.Sprintf("gen/f%02d.json", i), Score: scan.ScoreHigh},
+			scan.Candidate{Path: fmt.Sprintf("keep/f%02d.json", i), Score: scan.ScoreHigh, Preselected: i == 0},
+		)
+	}
+	cands = append(cands,
+		scan.Candidate{Path: "small/a.json", Score: scan.ScoreMedium},
+		scan.Candidate{Path: "small/b.json", Score: scan.ScoreMedium},
+	)
+	cl := newCandidateList(&scan.Result{Candidates: cands})
+	if !cl.collapsed["gen"] {
+		t.Errorf("gen/ (%d candidates, none checked) should start folded", treeCollapseThreshold+1)
+	}
+	if cl.collapsed["keep"] {
+		t.Errorf("keep/ (%d candidates, one checked) must start unfolded so the checked file is in view", treeCollapseThreshold+1)
+	}
+	if cl.collapsed["small"] {
+		t.Errorf("small/ (2 candidates) should start unfolded")
+	}
+	lines := cl.lines()
+	gen := dirLine(lines, "gen")
+	if gen < 0 || lines[gen].total != treeCollapseThreshold+1 || lines[gen].checked != 0 {
+		t.Fatalf("gen/ node = %+v, want %d/0", lines[gen], treeCollapseThreshold+1)
+	}
+	if rowLine(lines, 0) >= 0 {
+		t.Errorf("gen/f00.json should be hidden under the folded node")
+	}
+	if rowLine(lines, 1) < 0 {
+		t.Errorf("keep/f00.json (checked) should be rendered")
+	}
+}
+
+func TestCandidateTreeFilterShowsMatchesUnderFoldedNodes(t *testing.T) {
+	cl := newTreeCandidateList()
+	cl.collapsed["config"] = true
+	pressRune(cl, "/")
+	pressRune(cl, "keys")
+	if cl.filter != "keys" {
+		t.Fatalf("filter = %q, want %q", cl.filter, "keys")
+	}
+	if got, want := treeShape(cl), "0:config/ 1:config/deep/ 2:config/deep/keys.pem"; got != want {
+		t.Fatalf("filtered tree = %q, want %q (folding is suspended while a filter is active)", got, want)
+	}
+	cl.update(tea.KeyMsg{Type: tea.KeyEnter}, "")
+	if cl.filtering || cl.filter != "keys" {
+		t.Fatalf("enter should leave filter mode keeping the filter")
+	}
+	// Folding keys are no-ops while the filter is active.
+	cl.cursor = 0
+	cl.update(tea.KeyMsg{Type: tea.KeyRight}, "")
+	pressRune(cl, "h")
+	if got, want := treeShape(cl), "0:config/ 1:config/deep/ 2:config/deep/keys.pem"; got != want {
+		t.Fatalf("filtered tree after fold keys = %q, want unchanged %q", got, want)
+	}
+	if !cl.collapsed["config"] {
+		t.Fatalf("the fold state must survive the filter untouched")
+	}
+	cl.filter = ""
+	if got, want := treeShape(cl), "0:.env 0:config/ 0:src/ 1:src/app.json"; got != want {
+		t.Fatalf("tree after clearing the filter = %q, want %q", got, want)
+	}
+}
+
+func TestCandidateListViewWindowFollowsCursor(t *testing.T) {
+	var cands []scan.Candidate
+	for i := 0; i < 40; i++ {
+		cands = append(cands, scan.Candidate{Path: fmt.Sprintf("f%02d.json", i), Score: scan.ScoreMedium})
+	}
+	cl := newCandidateList(&scan.Result{Candidates: cands})
+	cl.SetSize(80, listOverhead+11) // 11 tree lines per page
+
+	view := cl.View()
+	if !strings.Contains(view, "f00.json") || !strings.Contains(view, "f10.json") || strings.Contains(view, "f11.json") {
+		t.Fatalf("first page should show f00..f10 only:\n%s", view)
+	}
+	if !strings.Contains(view, "↓ 29 more") || strings.Contains(view, "↑") {
+		t.Errorf("first page markers wrong:\n%s", view)
+	}
+
+	cl.update(tea.KeyMsg{Type: tea.KeyEnd}, "")
+	if cl.cursor != 39 {
+		t.Fatalf("end: cursor = %d, want 39", cl.cursor)
+	}
+	view = cl.View()
+	if !strings.Contains(view, "f39.json") || !strings.Contains(view, "f29.json") || strings.Contains(view, "f28.json") {
+		t.Fatalf("after end the window should show f29..f39:\n%s", view)
+	}
+	if !strings.Contains(view, "↑ 29 more") || strings.Contains(view, "↓") {
+		t.Errorf("last page markers wrong:\n%s", view)
+	}
+
+	cl.update(tea.KeyMsg{Type: tea.KeyPgUp}, "")
+	if cl.cursor != 28 {
+		t.Fatalf("pgup: cursor = %d, want 28", cl.cursor)
+	}
+	if view = cl.View(); !strings.Contains(view, "f28.json") || strings.Contains(view, "f39.json") {
+		t.Fatalf("after pgup the window should scroll up to keep the cursor in view:\n%s", view)
+	}
+	cl.update(tea.KeyMsg{Type: tea.KeyHome}, "")
+	cl.update(tea.KeyMsg{Type: tea.KeyPgDown}, "")
+	if cl.cursor != 11 {
+		t.Fatalf("home, pgdown: cursor = %d, want 11", cl.cursor)
+	}
+
+	// Without a known size everything is rendered.
+	cl.SetSize(0, 0)
+	view = cl.View()
+	if !strings.Contains(view, "f00.json") || !strings.Contains(view, "f39.json") || strings.Contains(view, "more") {
+		t.Errorf("unsized list should render every line with no markers:\n%s", view)
+	}
+}
+
+func TestRenderDirRow(t *testing.T) {
+	tests := []struct {
+		total, checked int
+		expanded       bool
+		wantBox        string
+		wantMarker     string
+	}{
+		{3, 3, true, "[x]", "▾"},
+		{3, 1, false, "[-]", "▸"},
+		{3, 0, true, "[ ]", "▾"},
+	}
+	for _, tt := range tests {
+		l := treeLine{dir: "a/config", row: -1, depth: 1, total: tt.total, checked: tt.checked}
+		got := renderDirRow(l, tt.expanded, false)
+		if !strings.Contains(got, tt.wantBox) {
+			t.Errorf("renderDirRow(%d/%d) = %q, want box %q", tt.checked, tt.total, got, tt.wantBox)
+		}
+		if !strings.Contains(got, "  "+tt.wantMarker+" config/") {
+			t.Errorf("renderDirRow(expanded=%v) = %q, want indented %q marker and the base name", tt.expanded, got, tt.wantMarker)
+		}
+		if want := fmt.Sprintf("%d/%d selected", tt.checked, tt.total); !strings.Contains(got, want) {
+			t.Errorf("renderDirRow(%d/%d) = %q, want %q", tt.checked, tt.total, got, want)
+		}
+	}
+}
+
+func TestRenderCandidateRowIndentsByDepth(t *testing.T) {
+	c := scan.Candidate{Path: "config/app.yaml", Score: scan.ScoreMedium}
+	got := renderCandidateRow(c, false, false, 1)
+	if !strings.Contains(got, "[ ]   app.yaml") {
+		t.Errorf("renderCandidateRow(depth 1) = %q, want the base name indented one level", got)
+	}
+	if strings.Contains(got, "config/app.yaml") {
+		t.Errorf("renderCandidateRow(depth 1) = %q, must not repeat the directory the tree already shows", got)
+	}
+}
+
+func TestCandidateListAddExtraRevealsFoldedDirectory(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "config"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "config", "extra.pem"), []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cl := newTreeCandidateList()
+	cl.collapsed["config"] = true
+	cl.update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("+")}, dir)
+	cl.update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("config/extra.pem")}, dir)
+	cl.update(tea.KeyMsg{Type: tea.KeyEnter}, dir)
+	if cl.adding {
+		t.Fatalf("adding mode should end after enter")
+	}
+	if cl.collapsed["config"] {
+		t.Fatalf("adding a path under a folded node should unfold it")
+	}
+	row := -1
+	for i, r := range cl.rows {
+		if r.c.Path == "config/extra.pem" && r.checked {
+			row = i
+		}
+	}
+	if row < 0 {
+		t.Fatalf("config/extra.pem was not added as checked: %+v", cl.rows)
+	}
+	if want := rowLine(cl.lines(), row); want < 0 || cl.cursor != want {
+		t.Errorf("cursor = %d, want %d (the added file's line)", cl.cursor, want)
 	}
 }
