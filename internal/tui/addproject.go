@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -168,6 +169,9 @@ func newRescanModel(ctx context.Context, s *app.Session, projectID, name, dir st
 
 func (m *addModel) SetSize(w, h int) {
 	m.width, m.height = w, h
+	if m.cand != nil {
+		m.cand.SetSize(w, h)
+	}
 	if m.apply != nil {
 		m.apply.SetSize(w, h)
 	}
@@ -617,6 +621,7 @@ func (m *addModel) updateScan(msg tea.Msg) (bool, tea.Cmd) {
 			return false, nil
 		}
 		m.cand = newCandidateList(msg.Result)
+		m.cand.SetSize(m.width, m.height)
 		return false, m.goTo(stepSelect)
 	}
 	return false, nil
@@ -743,7 +748,7 @@ func (m *addModel) View() string {
 		}
 		fmt.Fprintf(&b, "%s walked %d files, %d candidates — esc to stop\n", m.scanSpin.View(), m.walked, m.found)
 	case stepSelect:
-		b.WriteString(m.cand.View(m.width))
+		b.WriteString(m.cand.View())
 	case stepConfirm:
 		b.WriteString(m.viewConfirm())
 	case stepApply:
@@ -841,13 +846,52 @@ type candidateRow struct {
 	checked bool
 }
 
+// treeCollapseThreshold is the subtree size past which a directory node
+// starts folded, provided nothing under it is checked (spec §2.2 item 3): a
+// big folder with nothing selected is noise to scroll past, while a checked
+// file must stay in view so the list shows what enter is about to track.
+const treeCollapseThreshold = 10
+
+// treeIndent is the per-level indentation of the candidate tree.
+const treeIndent = "  "
+
+// treeLine is one rendered line of the candidate tree: either a directory
+// node (row < 0, dir set) or a file (row indexes candidateList.rows).
+type treeLine struct {
+	dir     string // slash-separated directory path of a directory node
+	row     int    // rows index of a file line; -1 for a directory node
+	depth   int    // nesting level; 0 for entries directly under the project root
+	total   int    // directory node: candidates in its subtree
+	checked int    // directory node: checked candidates in its subtree
+}
+
+// isDir reports whether the line is a directory node.
+func (l treeLine) isDir() bool { return l.row < 0 }
+
+// treeNode is a directory of the candidate tree while it is being built.
+type treeNode struct {
+	path  string
+	files []int       // rows indices, sorted by name
+	dirs  []*treeNode // sorted by path
+}
+
 // candidateList is the hand-rolled checklist for scanned candidates: a
 // bubbles/list delegate would not give us the checkbox/score-badge/reasons
 // columns the spec calls for, so this renders its own rows directly.
+//
+// rows is the flat backing store — what startApply, the confirm step and
+// untracked() read. On screen the rows are grouped as a directory tree
+// (lines) whose nodes fold and unfold; cursor and offset index that rendered
+// line list, not rows.
 type candidateList struct {
 	rows    []candidateRow
 	cursor  int
+	offset  int // first rendered line, kept so the window follows the cursor
 	showLow bool
+
+	// collapsed holds the folded directory nodes by path. It is ignored
+	// while a filter is active, so every match is shown wherever it sits.
+	collapsed map[string]bool
 
 	filtering   bool
 	filterInput textinput.Model
@@ -858,14 +902,24 @@ type candidateList struct {
 	addErr   string
 
 	nested []string
+
+	width, height int
 }
 
 func newCandidateList(res *scan.Result) *candidateList {
-	cl := &candidateList{}
+	cl := &candidateList{collapsed: map[string]bool{}}
 	if res != nil {
 		cl.nested = res.NestedRepos
 		for _, c := range res.Candidates {
 			cl.rows = append(cl.rows, candidateRow{c: c, checked: c.Preselected || c.Tracked})
+		}
+	}
+	// Fold the big directories nothing was pre-selected in, so a scan that
+	// found hundreds of candidates opens as a short overview with counts
+	// rather than a list to page through.
+	for _, l := range cl.flatten(cl.buildTree(), 0, true, nil) {
+		if l.isDir() && l.total > treeCollapseThreshold && l.checked == 0 {
+			cl.collapsed[l.dir] = true
 		}
 	}
 	fi := textinput.New()
@@ -876,6 +930,9 @@ func newCandidateList(res *scan.Result) *candidateList {
 	cl.addInput = ai
 	return cl
 }
+
+// SetSize records the terminal size, which bounds the rendered window.
+func (cl *candidateList) SetSize(w, h int) { cl.width, cl.height = w, h }
 
 // visible returns the indices into rows that pass the current filter and
 // low-score visibility setting.
@@ -915,6 +972,117 @@ func (cl *candidateList) untracked() []string {
 	return out
 }
 
+// buildTree groups the visible rows by directory. Every ancestor directory
+// of a visible row gets a node, so a lone deep file still renders under its
+// full chain of folders.
+func (cl *candidateList) buildTree() *treeNode {
+	root := &treeNode{path: "."}
+	nodes := map[string]*treeNode{".": root}
+	var node func(dir string) *treeNode
+	node = func(dir string) *treeNode {
+		if n, ok := nodes[dir]; ok {
+			return n
+		}
+		n := &treeNode{path: dir}
+		nodes[dir] = n
+		parent := node(path.Dir(dir))
+		parent.dirs = append(parent.dirs, n)
+		return n
+	}
+	for _, i := range cl.visible() {
+		n := node(path.Dir(cl.rows[i].c.Path))
+		n.files = append(n.files, i)
+	}
+	for _, n := range nodes {
+		files := n.files
+		sort.Slice(files, func(a, b int) bool { return cl.rows[files[a]].c.Path < cl.rows[files[b]].c.Path })
+		dirs := n.dirs
+		sort.Slice(dirs, func(a, b int) bool { return dirs[a].path < dirs[b].path })
+	}
+	return root
+}
+
+// subtreeCounts returns how many visible candidates sit under n, and how
+// many of them are checked.
+func (cl *candidateList) subtreeCounts(n *treeNode) (total, checked int) {
+	for _, i := range n.files {
+		total++
+		if cl.rows[i].checked {
+			checked++
+		}
+	}
+	for _, d := range n.dirs {
+		t, c := cl.subtreeCounts(d)
+		total += t
+		checked += c
+	}
+	return total, checked
+}
+
+// flatten appends the rendered lines of n's contents: its files first, then
+// each subdirectory as a node followed by its own contents when it is
+// unfolded (always, with expandAll).
+func (cl *candidateList) flatten(n *treeNode, depth int, expandAll bool, out []treeLine) []treeLine {
+	for _, i := range n.files {
+		out = append(out, treeLine{row: i, depth: depth})
+	}
+	for _, d := range n.dirs {
+		total, checked := cl.subtreeCounts(d)
+		out = append(out, treeLine{dir: d.path, row: -1, depth: depth, total: total, checked: checked})
+		if expandAll || !cl.collapsed[d.path] {
+			out = cl.flatten(d, depth+1, expandAll, out)
+		}
+	}
+	return out
+}
+
+// lines returns the tree as currently rendered: the visible rows grouped by
+// directory, with folded nodes' contents left out unless a filter is active.
+func (cl *candidateList) lines() []treeLine {
+	return cl.flatten(cl.buildTree(), 0, cl.filter != "", nil)
+}
+
+// subtreeRows returns the visible rows under dir.
+func (cl *candidateList) subtreeRows(dir string) []int {
+	var out []int
+	prefix := dir + "/"
+	for _, i := range cl.visible() {
+		if strings.HasPrefix(cl.rows[i].c.Path, prefix) {
+			out = append(out, i)
+		}
+	}
+	return out
+}
+
+// setChecked checks or unchecks every given row.
+func (cl *candidateList) setChecked(rows []int, checked bool) {
+	for _, i := range rows {
+		cl.rows[i].checked = checked
+	}
+}
+
+// dirLine returns the index of dir's node in lines, or -1 when it is not
+// rendered.
+func dirLine(lines []treeLine, dir string) int {
+	for i, l := range lines {
+		if l.isDir() && l.dir == dir {
+			return i
+		}
+	}
+	return -1
+}
+
+// rowLine returns the index of row's line in lines, or -1 when it is not
+// rendered (hidden by the filter, the low-score toggle or a folded node).
+func rowLine(lines []treeLine, row int) int {
+	for i, l := range lines {
+		if !l.isDir() && l.row == row {
+			return i
+		}
+	}
+	return -1
+}
+
 func (cl *candidateList) update(msg tea.Msg, dir string) tea.Cmd {
 	if cl.filtering {
 		return cl.updateFiltering(msg)
@@ -926,39 +1094,157 @@ func (cl *candidateList) update(msg tea.Msg, dir string) tea.Cmd {
 	if !ok {
 		return nil
 	}
-	vis := cl.visible()
+	lines := cl.lines()
+	var cmd tea.Cmd
 	switch key.String() {
 	case "up", "k":
-		if cl.cursor > 0 {
-			cl.cursor--
-		}
+		cl.cursor--
 	case "down", "j":
-		if cl.cursor < len(vis)-1 {
-			cl.cursor++
-		}
+		cl.cursor++
+	case "pgup":
+		cl.cursor -= cl.pageSize(len(lines))
+	case "pgdown":
+		cl.cursor += cl.pageSize(len(lines))
+	case "home":
+		cl.cursor = 0
+	case "end":
+		cl.cursor = len(lines) - 1
 	case " ":
-		if cl.cursor >= 0 && cl.cursor < len(vis) {
-			i := vis[cl.cursor]
-			cl.rows[i].checked = !cl.rows[i].checked
-		}
+		cl.toggleAt(lines)
+	case "a":
+		cl.setChecked(cl.visible(), true)
+	case "n":
+		cl.setChecked(cl.visible(), false)
+	case "left", "h":
+		cl.collapseAt(lines)
+	case "right", "l":
+		cl.expandAt(lines)
 	case "t":
 		cl.showLow = !cl.showLow
-		if cl.cursor >= len(cl.visible()) {
+		if cl.cursor >= len(cl.lines()) {
 			cl.cursor = 0
 		}
 	case "/":
 		cl.filtering = true
 		cl.filterInput.SetValue(cl.filter)
 		cl.filterInput.Focus()
-		return textinput.Blink
+		cmd = textinput.Blink
 	case "+":
 		cl.adding = true
 		cl.addInput.SetValue("")
 		cl.addInput.Focus()
 		cl.addErr = ""
-		return textinput.Blink
+		cmd = textinput.Blink
 	}
-	return nil
+	cl.clampCursor()
+	return cmd
+}
+
+// toggleAt flips the file under the cursor, or checks every candidate under
+// the directory node there (unchecking them all when they already are).
+func (cl *candidateList) toggleAt(lines []treeLine) {
+	if cl.cursor < 0 || cl.cursor >= len(lines) {
+		return
+	}
+	l := lines[cl.cursor]
+	if !l.isDir() {
+		cl.rows[l.row].checked = !cl.rows[l.row].checked
+		return
+	}
+	cl.setChecked(cl.subtreeRows(l.dir), l.checked < l.total)
+}
+
+// collapseAt folds the directory node under the cursor. On a file, or on a
+// node already folded, it folds the enclosing directory instead and moves
+// the cursor onto it, so repeated presses shut the tree level by level.
+// Folding is a no-op while a filter is active, since the filtered tree
+// always shows every match.
+func (cl *candidateList) collapseAt(lines []treeLine) {
+	if cl.filter != "" || cl.cursor < 0 || cl.cursor >= len(lines) {
+		return
+	}
+	l := lines[cl.cursor]
+	var target string
+	switch {
+	case l.isDir() && !cl.collapsed[l.dir]:
+		cl.collapsed[l.dir] = true
+		return
+	case l.isDir():
+		target = path.Dir(l.dir)
+	default:
+		target = path.Dir(cl.rows[l.row].c.Path)
+	}
+	if target == "." {
+		return
+	}
+	cl.collapsed[target] = true
+	if i := dirLine(cl.lines(), target); i >= 0 {
+		cl.cursor = i
+	}
+}
+
+// expandAt unfolds the directory node under the cursor.
+func (cl *candidateList) expandAt(lines []treeLine) {
+	if cl.filter != "" || cl.cursor < 0 || cl.cursor >= len(lines) {
+		return
+	}
+	if l := lines[cl.cursor]; l.isDir() {
+		delete(cl.collapsed, l.dir)
+	}
+}
+
+// listOverhead is the number of screen lines around the candidate tree: the
+// wizard title and its blank line, the list heading and its blank line, the
+// two window markers, the blank line before the footer, and two lines for
+// the help (the key list wraps on a narrow terminal) or for the filter/add
+// prompt and its error. Nested-repo notes are added per entry.
+const listOverhead = 9
+
+// pageSize is how many tree lines fit on screen at once, out of total.
+// Without a known height (before the first WindowSizeMsg) everything is
+// rendered.
+func (cl *candidateList) pageSize(total int) int {
+	if cl.height <= 0 {
+		if total < 1 {
+			return 1
+		}
+		return total
+	}
+	n := cl.height - listOverhead - len(cl.nested)
+	if n < 3 {
+		n = 3
+	}
+	return n
+}
+
+// clampCursor keeps the cursor inside the rendered lines and scrolls the
+// window so it stays in view.
+func (cl *candidateList) clampCursor() {
+	n := len(cl.lines())
+	if cl.cursor > n-1 {
+		cl.cursor = n - 1
+	}
+	if cl.cursor < 0 {
+		cl.cursor = 0
+	}
+	cl.follow(n)
+}
+
+// follow moves the rendered window of total lines so the cursor is inside it.
+func (cl *candidateList) follow(total int) {
+	page := cl.pageSize(total)
+	if cl.cursor < cl.offset {
+		cl.offset = cl.cursor
+	}
+	if cl.cursor >= cl.offset+page {
+		cl.offset = cl.cursor - page + 1
+	}
+	if cl.offset > total-page {
+		cl.offset = total - page
+	}
+	if cl.offset < 0 {
+		cl.offset = 0
+	}
 }
 
 func (cl *candidateList) updateFiltering(msg tea.Msg) tea.Cmd {
@@ -968,11 +1254,11 @@ func (cl *candidateList) updateFiltering(msg tea.Msg) tea.Cmd {
 			cl.filtering = false
 			cl.filter = ""
 			cl.filterInput.SetValue("")
-			cl.cursor = 0
+			cl.cursor, cl.offset = 0, 0
 			return nil
 		case "enter":
 			cl.filtering = false
-			cl.cursor = 0
+			cl.cursor, cl.offset = 0, 0
 			return nil
 		}
 	}
@@ -1014,6 +1300,7 @@ func (cl *candidateList) addExtra(rel string, size int64) {
 	for i := range cl.rows {
 		if cl.rows[i].c.Path == rel {
 			cl.rows[i].checked = true
+			cl.reveal(i)
 			return
 		}
 	}
@@ -1026,6 +1313,20 @@ func (cl *candidateList) addExtra(rel string, size int64) {
 		},
 		checked: true,
 	})
+	cl.reveal(len(cl.rows) - 1)
+}
+
+// reveal unfolds every directory above row and puts the cursor on it, so a
+// path typed with "+" is seen checked rather than swallowed by a folded
+// node.
+func (cl *candidateList) reveal(row int) {
+	for d := path.Dir(cl.rows[row].c.Path); d != "."; d = path.Dir(d) {
+		delete(cl.collapsed, d)
+	}
+	if i := rowLine(cl.lines(), row); i >= 0 {
+		cl.cursor = i
+		cl.clampCursor()
+	}
 }
 
 // cleanRelPath validates and slash-normalises a user-typed relative path.
@@ -1048,15 +1349,28 @@ func cleanRelPath(rel string) (string, bool) {
 	return rel, true
 }
 
-func (cl *candidateList) View(width int) string {
+func (cl *candidateList) View() string {
 	var b strings.Builder
-	b.WriteString("Select files to track:\n\n")
-	vis := cl.visible()
-	for i, idx := range vis {
-		row := cl.rows[idx]
-		b.WriteString(renderCandidateRow(row.c, row.checked, i == cl.cursor, width) + "\n")
+	n, _ := cl.selectedStats()
+	fmt.Fprintf(&b, "Select files to track (%d selected):\n\n", n)
+	lines := cl.lines()
+	cl.follow(len(lines))
+	page := cl.pageSize(len(lines))
+	end := cl.offset + page
+	if end > len(lines) {
+		end = len(lines)
 	}
-	if len(vis) == 0 {
+	windowed := len(lines) > page
+	if windowed {
+		b.WriteString(styles.Muted.Render(moreMarker("↑", cl.offset)) + "\n")
+	}
+	for i := cl.offset; i < end; i++ {
+		b.WriteString(cl.renderLine(lines[i], i == cl.cursor) + "\n")
+	}
+	if windowed {
+		b.WriteString(styles.Muted.Render(moreMarker("↓", len(lines)-end)) + "\n")
+	}
+	if len(lines) == 0 {
 		b.WriteString(styles.Muted.Render("(no candidates match)") + "\n")
 	}
 	for _, n := range cl.nested {
@@ -1075,21 +1389,63 @@ func (cl *candidateList) View(width int) string {
 		if cl.showLow {
 			low = "hide low"
 		}
-		b.WriteString(styles.Help.Render(fmt.Sprintf("space toggle  + add path  / filter  t %s  enter continue  esc back", low)))
+		b.WriteString(styles.Help.Render(fmt.Sprintf("space toggle  a all  n none  ←/→ collapse/expand  + add path  / filter  t %s  enter continue  esc back", low)))
 	}
 	return b.String()
 }
 
-// renderCandidateRow renders one candidate row: checkbox, path, size, score
-// badge and reasons (spec §2.2 item 3).
-func renderCandidateRow(c scan.Candidate, checked, cursor bool, width int) string {
+// moreMarker labels one edge of the rendered window with how many lines lie
+// beyond it, or is blank when none do, so the list keeps its height.
+func moreMarker(arrow string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("  %s %d more", arrow, n)
+}
+
+// renderLine renders one tree line: a directory node or a candidate row.
+func (cl *candidateList) renderLine(l treeLine, cursor bool) string {
+	if l.isDir() {
+		return renderDirRow(l, cl.filter != "" || !cl.collapsed[l.dir], cursor)
+	}
+	row := cl.rows[l.row]
+	return renderCandidateRow(row.c, row.checked, cursor, l.depth)
+}
+
+// renderCandidateRow renders one candidate row: checkbox, name (indented to
+// its depth in the tree), size, score badge and reasons (spec §2.2 item 3).
+func renderCandidateRow(c scan.Candidate, checked, cursor bool, depth int) string {
 	box := "[ ]"
 	if checked {
 		box = "[x]"
 	}
 	badge, style := scoreBadge(c.Score)
 	reasons := strings.Join(c.Reasons, ", ")
-	line := fmt.Sprintf("%s %-40s %10s %s  %s", box, truncatePath(c.Path, 40), formatSize(c.Size), style.Render(badge), styles.Muted.Render(reasons))
+	label := strings.Repeat(treeIndent, depth) + path.Base(c.Path)
+	line := fmt.Sprintf("%s %-40s %10s %s  %s", box, truncatePath(label, 40), formatSize(c.Size), style.Render(badge), styles.Muted.Render(reasons))
+	if cursor {
+		line = styles.Selected.Render(line)
+	}
+	return line
+}
+
+// renderDirRow renders a directory node: a checkbox summarising its subtree
+// ([x] all checked, [-] some, [ ] none), a fold marker, the name and how
+// many of its candidates are selected.
+func renderDirRow(l treeLine, expanded, cursor bool) string {
+	box := "[ ]"
+	switch {
+	case l.total > 0 && l.checked == l.total:
+		box = "[x]"
+	case l.checked > 0:
+		box = "[-]"
+	}
+	marker := "▸"
+	if expanded {
+		marker = "▾"
+	}
+	label := strings.Repeat(treeIndent, l.depth) + marker + " " + path.Base(l.dir) + "/"
+	line := fmt.Sprintf("%s %-40s %10s  %s", box, truncatePath(label, 40), "", styles.Muted.Render(fmt.Sprintf("%d/%d selected", l.checked, l.total)))
 	if cursor {
 		line = styles.Selected.Render(line)
 	}

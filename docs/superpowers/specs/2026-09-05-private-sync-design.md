@@ -77,9 +77,13 @@ Screens:
    proposes **associate** (default) and lists the vault-tracked files that are missing
    locally as `will be restored`; weak (`dir:` only) matches are shown with a warning;
    "create new project anyway" is an explicit choice → scanning (cancellable, live counter
-   "walked N files, M candidates — esc to stop") → candidate multi-select (columns: path,
-   size, score, reason; High pre-checked; `+` type an extra relative path; `/` filter;
-   `t` show low-score too) → name → confirm → Apply (upload/restore) → Push.
+   "walked N files, M candidates — esc to stop") → candidate multi-select, grouped as a
+   directory tree with folding nodes (columns: path, size, score, reason; High pre-checked
+   except in crowded directories, §6; `space` toggles a file or a whole node; `a`/`n`
+   select all/none of the listed files; `←`/`→` fold/unfold a node, and a node with more
+   than 10 candidates and nothing checked starts folded; the list scrolls to follow the
+   cursor; `+` type an extra relative path; `/` filter; `t` show low-score too) → name →
+   confirm → Apply (upload/restore) → Push.
 4. **Project detail**: file list with state; `a` add files (re-scan), `x` untrack file,
    `D` delete everywhere (confirm), `R` restore project (confirm), `-` unlink (confirm),
    `s` sync this project.
@@ -347,6 +351,12 @@ Scoring:
 * git-ignored and matches ⇒ **High** (exactly the files git does not carry).
 * untracked, not ignored ⇒ **Medium**; pre-selected only if secret-ish.
 * no git info ⇒ **Medium**; secret-ish ⇒ **High**.
+* **crowded directory**: when more than `MaxPreselectPerDir` (default 10) candidates in
+  one directory would be pre-selected on score alone, none of them is — the scores stay,
+  `Preselected` is cleared and the reason `crowded directory` is added. A directory with
+  dozens of git-ignored `.json`/`.yaml` files is generated output or a cache far more
+  often than a nest of secrets. Vault-tracked and secret-ish candidates neither count
+  towards the limit nor lose their pre-selection.
 
 Files already tracked in the vault for that project are shown as `tracked` and checked.
 
@@ -363,7 +373,7 @@ type Options struct {
     MaxFileSize int64
     HardExclude []string            // absolute paths (key file, vault dir)
     Tracked map[string]bool         // relpaths already in the vault
-    MaxFiles, MaxCandidates int     // 0 = defaults
+    MaxFiles, MaxCandidates, MaxPreselectPerDir int   // 0 = defaults
     Progress func(walked, found int)
 }
 type Result struct { Candidates []Candidate; NestedRepos []string; GitInfo bool; Truncated bool; Warnings []string }

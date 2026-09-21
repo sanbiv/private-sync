@@ -1295,3 +1295,96 @@ func TestScanVaultTrackedThroughSymlinkedDirRejected(t *testing.T) {
 		t.Errorf("in.yaml missing: %v", paths(res.Candidates))
 	}
 }
+
+// TestScanCrowdedDirDropsScorePreselection pins the per-directory cap on
+// score-based pre-selection (spec §6): a directory holding more than
+// DefaultMaxPreselectPerDir git-ignored candidates is far more likely to be
+// generated output than a nest of secrets, so none of them is pre-selected
+// (they keep their High score and gain ReasonCrowdedDir), while a
+// vault-tracked file and a secret-named file in the same directory stay
+// pre-selected and are not counted, and a small directory is untouched.
+func TestScanCrowdedDirDropsScorePreselection(t *testing.T) {
+	root := t.TempDir()
+	var gen []string
+	for i := 0; i <= DefaultMaxPreselectPerDir; i++ { // one past the cap
+		rel := fmt.Sprintf("gen/f%02d.json", i)
+		writeFile(t, root, rel, []byte("{}"))
+		gen = append(gen, rel)
+	}
+	kept := []string{"gen/.env", "gen/pinned.json", "cfg/a.json", "cfg/b.json"}
+	for _, rel := range kept {
+		writeFile(t, root, rel, []byte("x"))
+	}
+	fg := &fakeGit{t: t, inTree: true, ignored: append(append([]string{}, kept...), gen...)}
+	res, err := Scan(context.Background(), root, Options{Tracked: map[string]bool{"gen/pinned.json": true}}, fg.runner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.GitInfo {
+		t.Fatalf("GitInfo false; warnings=%v", res.Warnings)
+	}
+	for _, rel := range gen {
+		c, ok := find(res.Candidates, rel)
+		if !ok {
+			t.Fatalf("%s missing from %v", rel, paths(res.Candidates))
+		}
+		if c.Score != ScoreHigh || c.Preselected || !contains(c.Reasons, ReasonCrowdedDir) {
+			t.Errorf("%s = %+v, want High, not preselected, with reason %q", rel, c, ReasonCrowdedDir)
+		}
+	}
+	for _, rel := range kept {
+		c, ok := find(res.Candidates, rel)
+		if !ok {
+			t.Fatalf("%s missing from %v", rel, paths(res.Candidates))
+		}
+		if !c.Preselected || contains(c.Reasons, ReasonCrowdedDir) {
+			t.Errorf("%s = %+v, want preselected without reason %q", rel, c, ReasonCrowdedDir)
+		}
+	}
+}
+
+// TestScanCrowdedDirCountsOnlyScoreBasedPicks pins two edges of the cap:
+// secret-named files do not count towards it, so a directory of a dozen
+// git-ignored .env.* files does not strip pre-selection from the one plain
+// config file beside them; and Options.MaxPreselectPerDir lowers the cap.
+func TestScanCrowdedDirCountsOnlyScoreBasedPicks(t *testing.T) {
+	root := t.TempDir()
+	var ignored []string
+	for i := 0; i < 12; i++ {
+		rel := fmt.Sprintf("envs/.env.%02d", i)
+		writeFile(t, root, rel, []byte("A=1"))
+		ignored = append(ignored, rel)
+	}
+	writeFile(t, root, "envs/settings.json", []byte("{}"))
+	ignored = append(ignored, "envs/settings.json")
+
+	fg := &fakeGit{t: t, inTree: true, ignored: ignored}
+	res, err := Scan(context.Background(), root, Options{}, fg.runner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Candidates) != 13 {
+		t.Fatalf("candidates = %v, want 13", paths(res.Candidates))
+	}
+	for _, c := range res.Candidates {
+		if !c.Preselected || contains(c.Reasons, ReasonCrowdedDir) {
+			t.Errorf("%s = %+v, want preselected: secret-named neighbours must not count as a crowd", c.Path, c)
+		}
+	}
+
+	// A second plain config file and a cap of 1: both plain files exceed it
+	// and lose pre-selection; the secret-named ones are still untouched.
+	writeFile(t, root, "envs/other.json", []byte("{}"))
+	ignored = append(ignored, "envs/other.json")
+	fg = &fakeGit{t: t, inTree: true, ignored: ignored}
+	res, err = Scan(context.Background(), root, Options{MaxPreselectPerDir: 1}, fg.runner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range res.Candidates {
+		wantPresel := c.SecretName
+		if c.Preselected != wantPresel || contains(c.Reasons, ReasonCrowdedDir) == wantPresel {
+			t.Errorf("%s = %+v, want preselected=%v (cap 1)", c.Path, c, wantPresel)
+		}
+	}
+}

@@ -66,6 +66,19 @@ Global flags: `--config`, `--yes`, `--strategy ask|local|remote|abort`, `--delet
 In the dashboard: `a` add project, `s` sync, `u` push, `d` pull, `r` fetch and
 refresh, `enter` details, `c` settings, `q` quit, `esc` back/cancel.
 
+In the add-project wizard the scanned files are listed as a folder tree: `space`
+toggles a file or a whole folder, `a` / `n` select all / none of the listed files,
+`←` / `→` (or `h` / `l`) collapse / expand a folder, `/` filters, `+` adds a path by
+hand, `t` also shows the low-score files git already commits. Folders holding more
+than 10 candidates with nothing selected start collapsed, and the list scrolls to
+follow the cursor (`pgup` / `pgdown`, `home` / `end`).
+
+Files are pre-selected when git ignores them or their name looks like a secret. A
+folder holding more than 10 files that would be pre-selected on score alone (a build
+cache, generated output, a data dump) gets none of them pre-selected — they show
+`crowded directory` as a reason — while files already in the vault and secret-like
+names (`.env`, `*.pem`, ...) inside it are still checked.
+
 ## Configuration (`~/.config/private-sync/config.yaml`)
 
 ```yaml
